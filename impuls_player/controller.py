@@ -70,6 +70,7 @@ class Controller:
         self.dispatch = dispatch or (lambda callback: callback())
         self._service = None
         self._queue = PlaybackQueue()
+        self._queue_visible_tracks = None
         self._shuffle_enabled = False
         self._repeat_enabled = False
         self._visible_tracks = []
@@ -154,6 +155,7 @@ class Controller:
         self._visible_tracks = []
         self._visible_wave = False
         self._queue.clear()
+        self._queue_visible_tracks = None
         self._page_loader = None
         self._queue_source = None
         self._queue_page_more = False
@@ -593,6 +595,7 @@ class Controller:
             self._wave_tracks = []
         self._configure_queue_modes(is_wave=self._wave is not None)
         self._queue.replace(self._visible_tracks, track, index=index)
+        self._queue_visible_tracks = self._visible_tracks
         if queued_wave is not None:
             self._queue.append_wave(queued_wave)
         self._start(track)
@@ -774,7 +777,16 @@ class Controller:
                 self.window.set_tracks(self._visible_tracks, 'Моя волна')
             self._wave_queued_batch = None
             self._wave_queued_view = None
-        self.window.set_now_playing(track)
+        index = None
+        if self._wave is not None and self._visible_wave:
+            # Wave batches have distinct Track objects even when IDs repeat;
+            # their visible row indices differ from the full radio history.
+            index = next((i for i, item in enumerate(self._visible_tracks) if item is track), None)
+        elif self._queue_visible_tracks is self._visible_tracks:
+            candidate = self._queue.current_index
+            if candidate is not None and candidate < len(self._visible_tracks) and self._visible_tracks[candidate] == track:
+                index = candidate
+        self.window.set_now_playing(track, index=index)
         self.window.set_playback(False)
         self.window.set_status('Подготовка трека…')
         if audio is not None:

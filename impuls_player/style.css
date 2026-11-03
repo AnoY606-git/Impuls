@@ -19,6 +19,8 @@ window, .app-shell {
 .window-header windowcontrols button { min-width: 25px; min-height: 24px; margin: 0; padding: 0; color: #24435f; background: transparent; border: 1px solid transparent; border-radius: 5px; box-shadow: none; }
 /* Some desktop themes make the child image transparent for their own CSD. */
 .window-header windowcontrols button image { color: #24435f; }
+.window-header .mini-mode-toggle { min-width: 28px; min-height: 26px; padding: 0; color: #24435f; }
+.window-header .mini-mode-toggle image { color: #24435f; }
 .window-header windowcontrols button:hover { background: #eff9ff; border-color: #9eb7ca; }
 .window-header windowcontrols button.close:hover { color: #ffffff; background: #a83d4e; border-color: #913348; }
 .window-header windowcontrols button.close:hover image { color: #ffffff; }
@@ -81,6 +83,10 @@ button:focus-visible, entry:focus-visible, searchentry:focus-visible, scale:focu
 .app-menu > button { min-width: 25px; min-height: 25px; padding: 0 3px; }
 
 .deck { padding-bottom: 8px; }
+.time-toggle, .time-toggle:checked, .time-toggle:hover {
+  min-width: 0; min-height: 0; padding: 0; margin: 0;
+  background: transparent; border: 0; box-shadow: none;
+}
 .led-display {
   min-height: 78px;
   margin: 6px 3px 2px;
@@ -101,6 +107,11 @@ button:focus-visible, entry:focus-visible, searchentry:focus-visible, scale:focu
 .display-duration, .stream-quality { color: #b7d6f0; font-family: monospace; font-size: 11px; }
 .display-duration { padding-bottom: 3px; }
 .seek-row { padding: 0 6px; }
+.moments-row { padding: 0 6px 3px; }
+.moment-hint { color: #38556e; font-size: 11px; }
+.moment-button { min-width: 24px; min-height: 24px; padding: 0 5px; color: #23435f; background: #e4eef5; border: 1px solid #8ba6bb; border-radius: 5px; }
+.moment-button image, .moment-button label { color: #23435f; }
+.moment-button label { font-family: monospace; font-size: 11px; }
 .metal-caption { color: #35516b; font-family: monospace; font-size: 10px; font-weight: bold; letter-spacing: 0.5px; }
 .deck-controls { padding: 4px 5px 0; }
 .transport-button, .favorite-button > button, .transport-toggle {

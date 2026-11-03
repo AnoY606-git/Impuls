@@ -202,6 +202,7 @@ class MusicService:
         self._client = None
         self._uid = ""
         self._cache_lock = threading.Lock()
+        self._cache_generation = 0
         self._likes_generation = 0
         self._likes_cache: tuple[float, tuple[str, ...]] | None = None
         self._likes_snapshot: tuple[str, ...] | None = None
@@ -289,6 +290,7 @@ class MusicService:
             with self._cache_lock:
                 self._uid = str(uid)
                 self._client = client
+                self._cache_generation += 1
                 self._likes_generation += 1
                 self._likes_cache = None
                 self._likes_snapshot = None
@@ -313,6 +315,7 @@ class MusicService:
     def invalidate_cache(self) -> None:
         """Refresh future views without altering captured playback snapshots."""
         with self._cache_lock:
+            self._cache_generation += 1
             self._likes_generation += 1
             self._likes_cache = None
             self._playlists_cache.clear()
@@ -349,6 +352,7 @@ class MusicService:
         _check_cancel(should_cancel)
         key = (owner, kind)
         with self._cache_lock:
+            generation = self._cache_generation
             cached = self._playlists_cache.get(key)
             if cached is not None and cached[0] > time.monotonic():
                 return cached[1]
@@ -359,7 +363,7 @@ class MusicService:
             raise ServiceError("Сервис вернул некорректный список треков плейлиста.")
         result = tuple(entries)
         with self._cache_lock:
-            if client is self._client:
+            if client is self._client and generation == self._cache_generation:
                 self._playlists_cache[key] = (time.monotonic() + _CACHE_SECONDS, result)
                 while len(self._playlists_cache) > _PLAYLIST_CACHE_LIMIT:
                     self._playlists_cache.pop(next(iter(self._playlists_cache)))
@@ -373,6 +377,7 @@ class MusicService:
         missing: list[str] = []
         now = time.monotonic()
         with self._cache_lock:
+            generation = self._cache_generation
             for identifier in dict.fromkeys(identifiers):
                 cached = self._metadata_cache.get(identifier)
                 if cached is not None and cached[0] > now:
@@ -402,7 +407,7 @@ class MusicService:
         if not result:
             raise ServiceError("Сервис не вернул данные запрошенных треков.")
         with self._cache_lock:
-            if client is self._client:
+            if client is self._client and generation == self._cache_generation:
                 for identifier in missing:
                     if identifier in result:
                         self._metadata_cache[identifier] = (expires, result[identifier])

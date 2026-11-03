@@ -21,6 +21,11 @@ class PlaybackQueue:
         return self._tracks[self._history[self._position]]
 
     @property
+    def current_index(self):
+        """The current occurrence's index in the loaded queue."""
+        return self._history[self._position] if self._position is not None else None
+
+    @property
     def has_next(self):
         """Whether Next can advance through loaded tracks without repeating."""
         return (self._position is not None

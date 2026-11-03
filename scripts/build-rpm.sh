@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=1.2.0
+version=1.3.0
 wheel_name=yandex_music-3.2.2-py3-none-any.whl
 wheel_sha=f2e603530c74a4affd2bead6f42e7b17c5e83732a2dda752206ef6c0d3dbf515
 wheel_url=https://files.pythonhosted.org/packages/78/3d/4735a1171d293e6b4bb46e5f271cd4d62f6b74f5c28c494afa99a720df44/yandex_music-3.2.2-py3-none-any.whl
@@ -13,18 +13,20 @@ source_files=(
   LICENSE README.md
   impuls_player/__init__.py impuls_player/__main__.py impuls_player/app.py
   impuls_player/controller.py impuls_player/mpris.py impuls_player/player.py
+  impuls_player/moments.py
   impuls_player/presets.py impuls_player/prefetch.py impuls_player/queue.py impuls_player/secrets.py
   impuls_player/settings.py impuls_player/tray.py impuls_player/visualizations.py
   impuls_player/service.py impuls_player/style.css impuls_player/ui.py impuls_player/wave.py
   tests/test_app.py tests/test_controller.py tests/test_library_contract.py
   tests/test_mpris.py tests/test_player.py tests/test_prefetch.py tests/test_presets.py tests/test_queue.py
+  tests/test_moments.py
   tests/test_secrets.py tests/test_service.py tests/test_source_archive.py
   tests/test_settings.py tests/test_tray.py tests/test_visualizations.py
   tests/test_ui.py tests/test_ui_helpers.py tests/test_wave.py
   data/impuls data/io.github.AnoY606_git.Impuls.desktop
   data/io.github.AnoY606_git.Impuls.metainfo.xml data/io.github.AnoY606_git.Impuls.svg
   docs/images/player.png docs/images/player-compact.png docs/images/visualizer.png docs/images/visualization-menu.png docs/images/help.png
-  docs/reviews/1.2.0.md
+  docs/images/player-mini.png
   packaging/impuls.spec scripts/build-rpm.sh
 )
 create_source() {

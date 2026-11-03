@@ -56,7 +56,9 @@ class Window:
     def set_playlists(self, playlists): pass
     def set_status(self, message): self.status = message
     def set_busy(self, busy): pass
-    def set_now_playing(self, track): pass
+    def set_now_playing(self, track, index=None):
+        self.now_playing = track
+        self.now_playing_index = index
     def set_playback(self, playing, position_ms=0, duration_ms=0): pass
     def show_error(self, message): self.errors.append(message)
     def show_device_code(self, code, url): pass
@@ -1405,6 +1407,47 @@ class ControllerTests(unittest.TestCase):
         self.controller.next_track()
         self.executor.run()
         self.assertEqual(self.player.urls[-1], 'https://music.example/following')
+
+    def test_duplicate_highlight_follows_next_previous_and_repeat(self):
+        self.login()
+        duplicate = Track('duplicate')
+        self.controller._visible_tracks = [duplicate, duplicate]
+        self.controller.play_track(duplicate, 0)
+        self.executor.run()
+        self.assertEqual(self.window.now_playing_index, 0)
+        self.controller.next_track()
+        self.executor.run()
+        self.assertEqual(self.window.now_playing_index, 1)
+        self.controller.previous_track()
+        self.executor.run()
+        self.assertEqual(self.window.now_playing_index, 0)
+        self.controller.set_repeat(True)
+        for expected in (1, 0):
+            self.controller.audio_ended()
+            self.executor.run()
+            self.assertEqual(self.window.now_playing_index, expected)
+
+    def test_playing_queue_does_not_send_an_index_from_another_view(self):
+        self.open_two_track_queue()
+        self.controller.search('new-view')
+        self.executor.run()
+        self.controller.next_track()
+        self.executor.run()
+        self.assertIsNone(self.window.now_playing_index)
+
+    def test_wave_highlight_distinguishes_equal_track_occurrences(self):
+        self.login()
+        first, duplicate = Track('duplicate'), Track('duplicate')
+        class Wave:
+            def __init__(self, service): pass
+            def start(self): return [first, duplicate]
+        self.controller.wave_factory = Wave
+        self.controller.wave()
+        self.executor.run()
+        self.executor.run()
+        self.controller.next_track()
+        self.executor.run()
+        self.assertEqual(self.window.now_playing_index, 1)
 
     def test_only_latest_track_resolves_to_audio(self):
         self.login()

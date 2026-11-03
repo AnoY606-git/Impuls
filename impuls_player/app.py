@@ -130,6 +130,8 @@ class ImpulsApplication(Gtk.Application):
             self.window.set_default_size(*values['window_size'])
             if values['window_maximized']:
                 self.window.maximize()
+        if hasattr(self.window, 'time_toggle'):
+            self.window.time_toggle.set_active(values.get('show_remaining', False))
         self._settings_loaded = True
 
     def _watch_settings(self):
@@ -138,7 +140,7 @@ class ImpulsApplication(Gtk.Application):
                     (self.window.visualization_selector, 'notify::selected')]
         controls.extend((slider, 'value-changed') for slider in self.window.equalizer_sliders)
         controls.extend((getattr(self.window, name), 'toggled') for name in
-                        ('shuffle_button', 'repeat_button', 'equalizer_toggle'))
+                        ('shuffle_button', 'repeat_button', 'equalizer_toggle', 'time_toggle'))
         controls.extend((self.window, f'notify::{name}') for name in
                         ('default-width', 'default-height', 'maximized'))
         for control, signal in controls:
@@ -170,12 +172,17 @@ class ImpulsApplication(Gtk.Application):
             'shuffle': getattr(self.controller, 'shuffle_enabled', False),
             'repeat': getattr(self.controller, 'repeat_enabled', False),
         }
+        if hasattr(self.window, 'time_toggle'):
+            values['show_remaining'] = self.window.time_toggle.get_active()
         toggle = getattr(self.window, 'equalizer_toggle', None)
         if toggle is not None:
             values['equalizer_expanded'] = toggle.get_active()
         if hasattr(self.window, 'get_default_size'):
-            values['window_size'] = tuple(self.window.get_default_size())
-            values['window_maximized'] = self.window.is_maximized()
+            if hasattr(self.window, 'normal_window_state'):
+                values['window_size'], values['window_maximized'] = self.window.normal_window_state()
+            else:
+                values['window_size'] = tuple(self.window.get_default_size())
+                values['window_maximized'] = self.window.is_maximized()
         saved = self.settings.save(values)
         if not saved:
             logging.getLogger(__name__).warning('Could not save application preferences to %s', self.settings.path)

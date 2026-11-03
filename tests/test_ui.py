@@ -44,6 +44,12 @@ def drain_until(predicate, timeout=2):
         raise AssertionError('Timed out waiting for GTK idle work')
 
 
+def supports_maximize():
+    display = Gdk.Display.get_default()
+    screen = getattr(display, 'get_screen', lambda: None)()
+    return screen is not None and screen.supports_net_wm_hint('_NET_WM_STATE_MAXIMIZED_VERT')
+
+
 def near_bottom_adjustment(window, allocate=True):
     # Keep the GTK adjustment deterministic instead of depending on a window
     # manager delivering a frame and recalculating its page size mid-test.
@@ -198,6 +204,164 @@ class PlayerWindowTests(unittest.TestCase):
         self.window.set_sleep_timer_remaining(None)
         self.assertFalse(self.window.sleep_timer_label.get_visible())
 
+    def test_rapid_keyboard_seeks_accumulate_only_after_success(self):
+        self.window.set_playback(True, 10000, 100000)
+        self.window.set_focus(None)
+        fractions = []
+        def seek(fraction):
+            fractions.append(fraction)
+            return round(fraction * 100000)
+        self.window.actions['seek'] = seek
+        for _ in range(3):
+            self.window._keyboard.emit('key-pressed', Gdk.KEY_Right, 0, Gdk.ModifierType.ALT_MASK)
+        self.assertEqual(fractions, [.15, .20, .25])
+        self.assertEqual(self.window.position_label.get_label(), '0:25')
+        self.window.actions['seek'] = lambda fraction: None
+        self.window._keyboard.emit('key-pressed', Gdk.KEY_Right, 0, Gdk.ModifierType.ALT_MASK)
+        self.assertEqual(self.window._position_ms, 25000)
+
+    def test_remaining_clock_handles_unknown_duration_and_track_end(self):
+        self.window.set_playback(True, 65000, 180000)
+        self.window.time_toggle.set_active(True)
+        self.assertEqual(self.window.position_label.get_label(), '−1:55')
+        self.window.set_playback(True, 190000, 180000)
+        self.assertEqual(self.window.position_label.get_label(), '−0:00')
+        self.window.set_playback(False, 0, 0)
+        self.assertEqual(self.window.position_label.get_label(), '−−:−−')
+        self.window.time_toggle.set_active(False)
+        self.assertEqual(self.window.position_label.get_label(), '0:00')
+
+    def test_moments_seek_and_follow_each_track_without_restarting(self):
+        first = SimpleNamespace(id='first', title='First', artists=('Artist',), duration_ms=100000)
+        second = SimpleNamespace(id='second', title='Second', artists=('Artist',), duration_ms=100000)
+        self.assertFalse(self.window.moment_add_button.get_sensitive())
+        self.window.set_now_playing(first)
+        self.window.set_playback(True, 12000, 100000)
+        self.window.moment_add_button.emit('clicked')
+        marker = button(self.window.moments_list, '0:12')
+        self.window.set_playback(True, 70000, 100000)
+        seeks = []
+        def seek(fraction):
+            seeks.append(fraction)
+            return round(fraction * 100000)
+        self.window.actions['seek'] = seek
+        marker.emit('clicked')
+        self.assertEqual(seeks, [.12])
+        self.assertEqual(self.window.position_label.get_label(), '0:12')
+        self.assertEqual(self.calls, [])
+        self.window.set_now_playing(second)
+        self.assertFalse(self.window.moment_clear_button.get_sensitive())
+        self.window.set_now_playing(first)
+        self.assertEqual(button(self.window.moments_list, '0:12').get_label(), '0:12')
+        self.window.moment_clear_button.emit('clicked')
+        self.assertFalse(self.window.moment_clear_button.get_sensitive())
+        self.window.set_playback(False, 0, 0)
+        self.assertFalse(self.window.moment_add_button.get_sensitive())
+
+    def test_moment_shortcut_respects_text_entry_and_mini_hides_the_strip(self):
+        track = SimpleNamespace(id='first', title='First', artists=('Artist',), duration_ms=100000)
+        self.window.set_now_playing(track)
+        self.window.set_playback(True, 5000, 100000)
+        self.window.set_focus(self.window.search_entry)
+        self.assertFalse(self.window._keyboard.emit('key-pressed', Gdk.KEY_b, 0, Gdk.ModifierType.CONTROL_MASK))
+        self.assertFalse(self.window.moment_clear_button.get_sensitive())
+        self.window.set_focus(None)
+        self.assertTrue(self.window._keyboard.emit('key-pressed', Gdk.KEY_b, 0, Gdk.ModifierType.CONTROL_MASK))
+        self.assertEqual(button(self.window.moments_list, '0:05').get_label(), '0:05')
+        self.window.set_mini_mode(True)
+        self.assertFalse(self.window.moments_row.get_visible())
+        self.window.set_mini_mode(False)
+        self.assertTrue(self.window.moments_row.get_visible())
+
+    def test_mini_mode_preserves_full_size_equalizer_and_playback(self):
+        self.window.set_default_size(980, 760)
+        self.window.set_equalizer_expanded(True)
+        self.window.set_playback(True, 15000, 90000)
+        self.window.set_mini_mode(True)
+        self.assertFalse(self.window.view_stack.get_visible())
+        self.assertFalse(self.window.equalizer_panel.get_visible())
+        self.assertEqual(self.window.normal_window_state(), ((980, 760), False))
+        self.assertEqual(self.window.position_label.get_label(), '0:15')
+        self.assertEqual(self.calls, [])
+        self.window.set_mini_mode(False)
+        self.assertEqual(tuple(self.window.get_default_size()), (980, 760))
+        self.assertTrue(self.window.equalizer_panel.get_visible())
+        self.assertTrue(self.window.equalizer_toggle.get_active())
+        self.assertTrue(self.window.view_stack.get_visible())
+
+    def test_search_shortcut_restores_library_from_mini_mode(self):
+        self.window.set_mini_mode(True)
+        self.window._keyboard.emit('key-pressed', Gdk.KEY_f, 0, Gdk.ModifierType.CONTROL_MASK)
+        self.assertFalse(self.window.mini_button.get_active())
+        self.assertTrue(self.window.view_stack.get_visible())
+        self.assertEqual(self.window.view_stack.get_visible_child_name(), 'library')
+
+    @unittest.skipUnless(supports_maximize(), 'Requires an X11 window manager with maximization')
+    def test_maximizing_mini_does_not_change_full_window_state(self):
+        self.window.set_default_size(980, 760)
+        self.window.present()
+        drain_until(lambda: self.window.get_width() > 0)
+        self.window.set_mini_mode(True)
+        self.window.maximize()
+        drain_until(self.window.is_maximized)
+        self.window.set_mini_mode(False)
+        drain_until(lambda: not self.window.is_maximized())
+        self.assertEqual(self.window.normal_window_state(), ((980, 760), False))
+
+    @unittest.skipUnless(supports_maximize(), 'Requires an X11 window manager with maximization')
+    def test_mini_from_maximized_resizes_and_restores_full_geometry(self):
+        self.window.set_default_size(980, 760)
+        self.window.present()
+        drain_until(lambda: self.window.get_width() > 0)
+        self.window.maximize()
+        drain_until(lambda: self.window.is_maximized() and self.window.get_width() != 980)
+        self.window.set_mini_mode(True)
+        drain_until(lambda: not self.window.is_maximized()
+                    and self.window.get_width() == 480 and self.window.get_height() == 340)
+        self.assertEqual(self.window.normal_window_state(), ((980, 760), True))
+        self.window.set_mini_mode(False)
+        drain_until(self.window.is_maximized)
+        self.window.unmaximize()
+        drain_until(lambda: not self.window.is_maximized()
+                    and self.window.get_width() == 980 and self.window.get_height() == 760)
+
+    def test_jump_to_current_uses_duplicate_occurrence_without_playing(self):
+        track = SimpleNamespace(id='same', title='Same', artists=('Artist',), album='', duration_ms=90000)
+        self.window.set_tracks([track, track], 'List')
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(1) is not None)
+        self.window.set_now_playing(track, index=1)
+        self.window.present()
+        drain_until(lambda: self.window.get_width() > 0)
+        self.window.set_mini_mode(True)
+        self.window.jump_to_current()
+        row = self.window.tracks_list.get_row_at_index(1)
+        self.assertIs(self.window.get_focus(), row)
+        self.assertTrue(self.window.view_stack.get_visible())
+        self.assertEqual(self.calls, [])
+        self.window.set_tracks([], 'Other list')
+        self.window.jump_to_current()
+        self.assertIn('открытом списке', self.window.status_label.get_label())
+
+    def test_jump_scrolls_to_current_track_outside_visible_page(self):
+        tracks = [SimpleNamespace(id=str(i), title=f'Track {i}', artists=('Artist',),
+                                  album='', duration_ms=90000) for i in range(50)]
+        self.window.set_default_size(720, 720)
+        self.window.set_tracks(tracks, 'List')
+        self.window.set_now_playing(tracks[40], index=40)
+        self.window.present()
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(49) is not None
+                    and self.window.track_scroll.get_height() > 0)
+        self.window.jump_to_current()
+        adjustment = self.window.track_scroll.get_vadjustment()
+        drain_until(lambda: adjustment.get_value() > 0)
+        row = self.window.tracks_list.get_row_at_index(40)
+        self.assertIs(self.window.get_focus(), row)
+        allocated, bounds = row.compute_bounds(self.window.tracks_list)
+        self.assertTrue(allocated)
+        self.assertLessEqual(adjustment.get_value(), bounds.get_y())
+        self.assertGreaterEqual(adjustment.get_value() + adjustment.get_page_size(),
+                                bounds.get_y() + bounds.get_height())
+
     def test_help_is_searchable_local_and_has_verified_project_links(self):
         from impuls_player import __version__
         button(self.window, 'Справка и о программе').emit('clicked')
@@ -231,7 +395,9 @@ class PlayerWindowTests(unittest.TestCase):
         self.window._show_help()
         dialog = self.window._help_window
         dialog.set_default_size(360, 360)
-        drain_until(lambda: dialog.get_width() > 0)
+        # present() may already have allocated the initial 560px window;
+        # wait for the asynchronous resize, not just any existing allocation.
+        drain_until(lambda: 0 < dialog.get_width() <= 380)
         self.assertLessEqual(dialog.get_width(), 380)
         scroller = next(w for w in walk(dialog) if isinstance(w, Gtk.ScrolledWindow))
         self.assertEqual(scroller.get_policy(), (Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC))
@@ -472,6 +638,50 @@ class PlayerWindowTests(unittest.TestCase):
         self.window.set_playlists([])
         old_list.emit('row-activated', old_row)
         self.assertEqual(self.calls, [])
+
+    def test_loaded_summary_counts_duplicate_occurrences_and_appended_pages(self):
+        track = SimpleNamespace(id='1', title='Повтор', artists=('A',), album='', duration_ms=90500)
+        self.window.set_tracks([track, track], 'Песни')
+        summary = getattr(self.window, 'list_summary_label', None)
+        self.assertIsNotNone(summary, 'Loaded tracks need a count and total duration')
+        self.assertEqual(summary.get_label(), 'Загружено: 2 · 3:01')
+        self.window.set_pagination(True)
+        self.assertEqual(summary.get_label(), 'Загружено: 2 · 3:01')
+        self.window.append_tracks([track])
+        self.assertEqual(summary.get_label(), 'Загружено: 3 · 4:31')
+        self.window.append_tracks([])
+        self.assertEqual(summary.get_label(), 'Загружено: 3 · 4:31')
+        self.assertIn('загруженных', summary.get_tooltip_text())
+
+    def test_loaded_summary_marks_unknown_duration_and_resets_for_new_views(self):
+        known = SimpleNamespace(id='1', title='A', artists=('A',), album='', duration_ms=60000)
+        unknown = SimpleNamespace(id='2', title='B', artists=('A',), album='', duration_ms=0)
+        self.window.set_tracks([known, unknown], 'Песни')
+        summary = getattr(self.window, 'list_summary_label', None)
+        self.assertIsNotNone(summary, 'Loaded tracks need a count and total duration')
+        self.assertEqual(summary.get_label(), 'Загружено: 2 · 1:00+')
+        self.assertIn('неизвестна', summary.get_tooltip_text())
+        self.window.set_playlists([])
+        self.assertFalse(summary.get_visible())
+        self.assertEqual(summary.get_label(), '')
+        self.window.set_tracks([unknown], 'Другой список')
+        self.assertTrue(summary.get_visible())
+        self.assertEqual(summary.get_label(), 'Загружено: 1 · 0:00+')
+        self.window.set_tracks([], 'Пустой список')
+        self.assertEqual(summary.get_label(), 'Загружено: 0 · 0:00')
+
+    def test_loaded_summary_does_not_expand_compact_window(self):
+        track = SimpleNamespace(id='1', title='A', artists=('A',), album='', duration_ms=5400000)
+        self.window.set_tracks([track] * 30, 'Песни')
+        summary = getattr(self.window, 'list_summary_label', None)
+        self.assertIsNotNone(summary, 'Loaded tracks need a count and total duration')
+        self.window.set_default_size(480, 600)
+        self.window.present()
+        drain_until(lambda: self.window.get_width() > 0 and summary.get_width() > 0)
+        self.assertLessEqual(self.window.get_width(), 480)
+        self.assertIn('2700:00', summary.get_label())
+        self.assertEqual(self.window.get_child().get_hadjustment().get_upper(),
+                         self.window.get_child().get_hadjustment().get_page_size())
 
     def test_append_tracks_preserves_indices_duplicates_and_pagination(self):
         track = SimpleNamespace(id='1', title='Повтор', artists=('A',), album='', duration_ms=0, cover_url=None)

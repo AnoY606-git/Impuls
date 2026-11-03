@@ -1,7 +1,7 @@
 %global buildsubdir impuls-%{version}
 
 Name:           impuls
-Version:        1.2.0
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Independent retro-styled Yandex Music player
 License:        GPL-3.0-only AND LGPL-3.0-only
@@ -74,6 +74,12 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:%{buildroot}%{_datadir}/impuls/vendor %{_
 %{_datadir}/metainfo/io.github.AnoY606_git.Impuls.metainfo.xml
 
 %changelog
+* Tue Nov 03 2026 AnoY606-git and contributors - 1.3.0-1
+- Add mini player, remaining-time display and jump to current track
+- Add session moment bookmarks and loaded playlist duration summary
+- Fix stale refresh caches, duplicate highlighting and rapid keyboard seeking
+- Keep internal review and planning documents out of release sources
+
 * Tue Nov 03 2026 AnoY606-git and contributors - 1.2.0-1
 - Polish popup menus and icons; autosave complete player preferences
 - Add sleep timer, playback shortcuts and track link sharing

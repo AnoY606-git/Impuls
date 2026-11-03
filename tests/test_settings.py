@@ -74,6 +74,25 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded['equalizer'], (0.0,) * 10)
             self.assertEqual(loaded['visualization'], 'ribbons')
 
+    def test_remaining_time_preference_defaults_and_roundtrips(self):
+        self.assertIs(self.settings.load().get('show_remaining'), False)
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.assertTrue(self.settings.save({'show_remaining': enabled}))
+                self.assertIs(Settings(self.path).load().get('show_remaining'), enabled)
+
+    def test_remaining_time_preference_rejects_non_boolean_values(self):
+        self.path.parent.mkdir()
+        for invalid in (0, 1, 'true', 'false', None, [], {}):
+            with self.subTest(invalid=invalid):
+                values = {'show_remaining': invalid, 'quality': 'lossless'}
+                self.path.write_text(json.dumps(values))
+                loaded = self.settings.load()
+                self.assertIs(loaded.get('show_remaining'), False)
+                self.assertEqual(loaded['quality'], 'lossless')
+                self.assertTrue(self.settings.save(values))
+                self.assertIs(json.loads(self.path.read_text()).get('show_remaining'), False)
+
     def test_failed_atomic_write_preserves_existing_settings(self):
         self.settings.save({'volume': .4})
         before = self.path.read_bytes()

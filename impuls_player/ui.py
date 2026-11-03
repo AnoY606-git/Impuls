@@ -18,6 +18,7 @@ gi.require_foreign("cairo")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
 from impuls_player.presets import EQUALIZER_PRESETS
+from impuls_player.moments import MomentBook
 
 
 def _format_time(milliseconds: int) -> str:
@@ -92,6 +93,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.actions = actions
         self._account: str | None = None
         self._current_track = None
+        self._moments = MomentBook()
         self._track_rows: dict[Gtk.ListBoxRow, tuple[object, int]] = {}
         self._playlist_rows: dict[Gtk.ListBoxRow, object] = {}
         self._rows_by_track_id: dict[str, list[Gtk.ListBoxRow]] = {}
@@ -102,6 +104,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._render_generation = 0
         self._render_kind = "tracks"
         self._rendered_track_count = 0
+        self._loaded_duration_ms = 0
+        self._unknown_duration_count = 0
         self._retired_lists = deque()
         self._dispose_source_id = 0
         self._pagination_has_more = False
@@ -119,6 +123,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._last_volume = 0.75
         self._position_ms = 0
         self._duration_ms = 0
+        self._mini_mode = False
+        self._full_window_size = (960, 800)
+        self._full_window_maximized = False
+        self._jump_tick_id = 0
+        self._geometry_tick_id = 0
         self._tray_available = False
         self._visualization_mode = "ribbons"
         self._visualization_phase = 0.0
@@ -144,6 +153,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         header.set_show_title_buttons(True)
         header.set_decoration_layout(":minimize,maximize,close")
         header.set_title_widget(_label("Impuls", "window-title", xalign=0.5))
+        self.mini_button = Gtk.ToggleButton(icon_name="view-restore-symbolic")
+        self.mini_button.add_css_class("mini-mode-toggle")
+        self.mini_button.set_tooltip_text("Мини-плеер · Ctrl+Shift+M")
+        self.mini_button.update_property([Gtk.AccessibleProperty.LABEL], ["Мини-плеер"])
+        self.mini_button.connect("toggled", lambda button: self.set_mini_mode(button.get_active()))
+        header.pack_start(self.mini_button)
         self.set_titlebar(header)
         self._build()
         self.connect("destroy", self._on_destroy)
@@ -202,7 +217,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.view_stack.set_transition_duration(180)
         self.view_stack.set_vexpand(True)
         root.append(self._build_deck())
-        root.append(self._build_equalizer())
+        self.equalizer_panel = self._build_equalizer()
+        root.append(self.equalizer_panel)
         self.view_stack.add_titled(self._build_visualizer(), "now", "Сейчас играет")
         self.view_stack.add_titled(self._build_library(), "library", "Медиатека")
         self.view_stack.set_visible_child_name("library")
@@ -213,6 +229,109 @@ class PlayerWindow(Gtk.ApplicationWindow):
         keyboard.connect("key-pressed", self._on_key_pressed)
         self.add_controller(keyboard)
         self._keyboard = keyboard
+
+    def normal_window_state(self) -> tuple[tuple[int, int], bool]:
+        """Mini mode must never overwrite the user's normal window geometry."""
+        if self._mini_mode or self._geometry_tick_id:
+            return self._full_window_size, self._full_window_maximized
+        return tuple(self.get_default_size()), self.is_maximized()
+
+    def set_mini_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._mini_mode:
+            return
+        if enabled:
+            self._full_window_size, self._full_window_maximized = self.normal_window_state()
+        self._mini_mode = enabled
+        self.mini_button.set_active(enabled)
+        self.mini_button.set_tooltip_text("Полный плеер · Ctrl+Shift+M" if enabled else "Мини-плеер · Ctrl+Shift+M")
+        self.mini_button.update_property([Gtk.AccessibleProperty.LABEL],
+                                        ["Полный плеер" if enabled else "Мини-плеер"])
+        self.view_stack.set_visible(not enabled)
+        self.equalizer_panel.set_visible(not enabled)
+        self.view_switcher.set_visible(not enabled)
+        self.moments_row.set_visible(not enabled)
+        if enabled:
+            self.unmaximize()
+            self.set_size_request(480, 240)
+            self.set_default_size(480, 340)
+        else:
+            self.set_size_request(480, 360)
+            self.set_default_size(*self._full_window_size)
+            if self._full_window_maximized:
+                self.maximize()
+            else:
+                self.unmaximize()
+        self._settle_window_geometry((480, 340) if enabled else self._full_window_size,
+                                     False if enabled else self._full_window_maximized)
+
+    def _settle_window_geometry(self, size: tuple[int, int], maximized: bool) -> None:
+        # Native unmaximize is asynchronous and may overwrite default_size with
+        # the old restored size. Apply our target after that state has settled.
+        if self._geometry_tick_id:
+            self.remove_tick_callback(self._geometry_tick_id)
+        attempts = stable = 0
+        def settle(_widget, _clock):
+            nonlocal attempts, stable
+            attempts += 1
+            if self._destroyed or attempts > 60:
+                self._geometry_tick_id = 0
+                return GLib.SOURCE_REMOVE
+            if self.is_maximized() != maximized:
+                stable = 0
+                return GLib.SOURCE_CONTINUE
+            if tuple(self.get_default_size()) != size:
+                self.set_default_size(*size)
+                stable = 0
+                return GLib.SOURCE_CONTINUE
+            if not maximized and (self.get_width(), self.get_height()) != size:
+                stable = 0
+                return GLib.SOURCE_CONTINUE
+            stable += 1
+            if stable < 2:
+                return GLib.SOURCE_CONTINUE
+            self._geometry_tick_id = 0
+            return GLib.SOURCE_REMOVE
+        self._geometry_tick_id = self.add_tick_callback(settle)
+
+    def jump_to_current(self) -> None:
+        """Focus the current occurrence in the loaded list without restarting it."""
+        self.set_mini_mode(False)
+        self.view_stack.set_visible_child_name("library")
+        self._refresh_current_row()
+        if self._jump_tick_id:
+            self.remove_tick_callback(self._jump_tick_id)
+            self._jump_tick_id = 0
+        row = self._highlighted_row
+        if row is None or self.stack.get_visible_child_name() != "tracks":
+            self.set_status("Текущий трек отсутствует в открытом списке")
+            return
+        row.grab_focus()
+        # ListBox focus alone does not scroll with selection mode NONE.
+        # Wait for layout after restoring a hidden mini-player library.
+        attempts = 0
+        def scroll_to_row(_widget, _clock):
+            nonlocal attempts
+            attempts += 1
+            if self._destroyed or row.get_parent() is not self.tracks_list or attempts > 30:
+                self._jump_tick_id = 0
+                return GLib.SOURCE_REMOVE
+            if not row.get_mapped() or row.get_height() <= 0:
+                return GLib.SOURCE_CONTINUE
+            valid, bounds = row.compute_bounds(self.tracks_list)
+            if valid:
+                adjustment = self.track_scroll.get_vadjustment()
+                if adjustment.get_page_size() <= 0 or adjustment.get_upper() < bounds.get_y() + bounds.get_height():
+                    return GLib.SOURCE_CONTINUE
+                target = min(bounds.get_y(), max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size()))
+                if abs(adjustment.get_value() - target) > 0.5:
+                    adjustment.set_value(target)
+                    # Focus/layout can reset the adjustment during this frame.
+                    # Confirm the position on the following frame.
+                    return GLib.SOURCE_CONTINUE
+            self._jump_tick_id = 0
+            return GLib.SOURCE_REMOVE
+        self._jump_tick_id = self.add_tick_callback(scroll_to_row)
 
     def _panel_title(self, title: str) -> Gtk.Box:
         bar = _box(Gtk.Orientation.HORIZONTAL, 8, "panel-title")
@@ -268,7 +387,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.position_label = _label("0:00", "display-time")
         self.position_label.update_property([Gtk.AccessibleProperty.LABEL], ["Текущая позиция"])
         self.position_label.set_width_chars(5)
-        clock.append(self.position_label)
+        self.time_toggle = Gtk.ToggleButton()
+        self.time_toggle.add_css_class("time-toggle")
+        self.time_toggle.set_tooltip_text("Прошло / осталось — нажмите для переключения")
+        self.time_toggle.update_property([Gtk.AccessibleProperty.LABEL], ["Показывать оставшееся время"])
+        self.time_toggle.set_child(self.position_label)
+        self.time_toggle.connect("toggled", lambda _: self._refresh_clock())
+        clock.append(self.time_toggle)
         display.append(clock)
         display_details = _box(Gtk.Orientation.VERTICAL, 3, "display-details")
         display_details.set_hexpand(True)
@@ -308,6 +433,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.seek_scale.connect("change-value", self._on_seek)
         seek_row.append(self.seek_scale)
         deck.append(seek_row)
+        self.moments_row = _box(Gtk.Orientation.HORIZONTAL, 6, "moments-row")
+        self.moments_row.append(_label("МОМЕНТЫ", "metal-caption"))
+        self.moment_add_button = _icon_button("bookmark-new-symbolic", "Запомнить этот момент · Ctrl+B", "moment-button")
+        self.moment_add_button.set_sensitive(False)
+        self.moment_add_button.connect("clicked", lambda _: self._add_moment())
+        self.moments_row.append(self.moment_add_button)
+        self.moments_list = _box(Gtk.Orientation.HORIZONTAL, 4)
+        self.moments_list.set_hexpand(True)
+        self.moments_row.append(self.moments_list)
+        self.moment_clear_button = _icon_button("edit-clear-symbolic", "Очистить моменты этого трека", "moment-button")
+        self.moment_clear_button.connect("clicked", lambda _: self._clear_moments())
+        self.moments_row.append(self.moment_clear_button)
+        deck.append(self.moments_row)
+        self._render_moments()
 
         controls = _box(Gtk.Orientation.HORIZONTAL, 8, "deck-controls")
         self.deck_controls = controls
@@ -422,6 +561,47 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _toggle_mute(self, _button=None) -> None:
         self.volume_scale.set_value(self._last_volume if self.volume_scale.get_value() == 0 else 0.0)
 
+    def _moment_track_id(self) -> str:
+        return str(self._current_track.id) if self._current_track is not None else ""
+
+    def _add_moment(self) -> None:
+        result = self._moments.add(self._moment_track_id(), self._position_ms, self._duration_ms)
+        messages = {"added": "Момент сохранён до закрытия плеера", "duplicate": "Этот момент уже отмечен",
+                    "full": "У трека уже 5 моментов. Очистите их, чтобы добавить новые",
+                    "unavailable": "Момент можно отметить после загрузки трека"}
+        self.set_status(messages[result])
+        self._render_moments()
+
+    def _clear_moments(self) -> None:
+        self._moments.clear(self._moment_track_id())
+        self._render_moments()
+
+    def _render_moments(self) -> None:
+        child = self.moments_list.get_first_child()
+        while child is not None:
+            following = child.get_next_sibling()
+            self.moments_list.remove(child)
+            child = following
+        track_id = self._moment_track_id()
+        positions = self._moments.positions(track_id)
+        self.moment_clear_button.set_sensitive(bool(positions))
+        if not positions:
+            hint = _label("Любимый фрагмент — в одно нажатие", "moment-hint")
+            hint.set_ellipsize(Pango.EllipsizeMode.END)
+            hint.set_width_chars(1)
+            hint.set_hexpand(True)
+            self.moments_list.append(hint)
+        for position in positions:
+            marker = Gtk.Button(label=_format_time(position))
+            marker.add_css_class("moment-button")
+            marker.set_tooltip_text(f"Перейти к {_format_time(position)} · отметка текущего сеанса")
+            marker.connect("clicked", lambda _, key=track_id, point=position: self._jump_moment(key, point))
+            self.moments_list.append(marker)
+
+    def _jump_moment(self, track_id: str, position: int) -> None:
+        if track_id == self._moment_track_id() and self._duration_ms > 0:
+            self._seek_to(min(1.0, position / self._duration_ms))
+
     def _build_app_menu(self) -> Gtk.MenuButton:
         menu = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu.add_css_class("app-menu")
@@ -435,6 +615,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         help_button = Gtk.Button(label="Горячие клавиши")
         help_button.connect("clicked", lambda _: (popover.popdown(), self._show_shortcuts()))
         body.append(help_button)
+        mini = Gtk.Button(label="Мини-плеер / полный вид · Ctrl+Shift+M")
+        mini.connect("clicked", lambda _: (popover.popdown(), self.set_mini_mode(not self._mini_mode)))
+        body.append(mini)
+        current = Gtk.Button(label="К играющему треку · Ctrl+J")
+        current.connect("clicked", lambda _: (popover.popdown(), self.jump_to_current()))
+        body.append(current)
         self.hide_button = Gtk.Button(label="Свернуть в трей")
         self.hide_button.set_sensitive(False)
         self.hide_button.connect("clicked", lambda _: (popover.popdown(), self._call("hide_window")))
@@ -497,12 +683,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         search.add_css_class("help-search")
         content.append(search)
         topics = (
+            ("Моменты и итоги списка", "Кнопка закладки под перемоткой или Ctrl+B отмечает любимый фрагмент. Нажмите на время отметки, чтобы вернуться к нему. До пяти отметок на трек; кнопка очистки удаляет отметки только текущей песни. Отметки действуют до закрытия плеера и хранятся для 32 треков; при добавлении 33-го освобождаются отметки самого давнего. В мини-плеере полоса скрыта, Ctrl+B продолжает работать.\n\nСправа от кнопок списка показаны число загруженных треков и общая длительность. Повторы считаются отдельно. Знак + означает, что длительность части треков неизвестна. Итог относится к загруженным страницам, а не ко всей коллекции."),
+            ("Мини-плеер и счётчик времени", "Кнопка слева в заголовке окна, меню приложения или Ctrl+Shift+M включают мини-плеер. Музыка продолжает играть; полный вид возвращается с прежним размером и состоянием эквалайзера. При новом запуске открывается полный вид.\n\nНажмите на крупные цифры времени, чтобы переключить прошедшее и оставшееся время. Минус означает остаток; −−:−− — неизвестную длительность. Выбор сохраняется.\n\nCtrl+J или «К играющему треку» в меню прокручивает открытый список к текущему треку, если он уже загружен. Ctrl+F возвращает полный вид и поиск."),
             ("Начало работы и медиатека", "Нажмите «Войти», затем откройте «Мою волну», любимые треки или плейлисты. Для поиска введите название или исполнителя и нажмите Enter. Щелчок по строке или кнопка ▶ запускает трек.\n\n«Слушать всё» запускает текущий список с начала; «Перемешать» меняет его порядок. Следующие страницы загружаются при прокрутке. Меню ⋮ у трека копирует название или ссылку и открывает страницу Яндекс Музыки. Сердце рядом с кнопками проигрывания добавляет текущий трек в любимое или удаляет его."),
             ("Вход и конфиденциальность", "Выберите «Войти по коду» и подтвердите вход на предложенной странице Яндекса. Пароль вводится только на странице Яндекса. Существующий токен можно ввести вручную.\n\n«Запомнить вход» сохраняет токен в системном Secret Service (например, GNOME Keyring или совместимом KWallet). Если хранилище недоступно, можно войти только на текущий сеанс. «Выйти» рядом с аккаунтом удаляет сохранённый токен, но не отзывает его у Яндекса.\n\nВ файле настроек нет токенов. У Impuls нет своего сервера, рекламы и встроенной аналитики; музыка и данные аккаунта запрашиваются у Яндекса. Не передавайте токен в сообщениях об ошибках."),
             ("Звук, качество и эквалайзер", "NQ — экономичное, HQ — высокое, Lossless — запрос звука без потерь. Выбор действует со следующего трека. Формат рядом с исполнителем показывает фактически полученный поток: сервис может вернуть AAC или MP3 вместо FLAC. Доступность зависит от трека, аккаунта и подписки.\n\nКнопка динамика отключает звук и возвращает прежнюю громкость. Кнопка + раскрывает десятиполосный эквалайзер: выберите пресет или настройте полосы вручную. «Сброс» возвращает их к 0 дБ. Эквалайзер и визуализации требуют gstreamer1-plugins-good.\n\nПовтор и случайный порядок действуют в обычной медиатеке. «Моя волна» сохраняет порядок рекомендаций и сама запрашивает следующую партию."),
             ("Настройки и визуализация", "Громкость, качество, полосы и видимость эквалайзера, случайный порядок, повтор, выбранная визуализация и размер окна сохраняются автоматически. Файл: ~/.config/impuls/settings.json, либо каталог XDG_CONFIG_HOME/impuls.\n\nВо вкладке «Сейчас играет» выберите «Ленты», «Спектр», «Зеркало» или «Орбита». Визуализация использует реальный звук и останавливается в тишине. Системное отключение анимаций учитывается переходами интерфейса."),
             ("Трей и таймер сна", "При доступном системном трее закрытие окна скрывает плеер, сохраняя воспроизведение. Вернуть его можно через значок Impuls. Без трея закрытие завершает приложение. «Выйти из Impuls» в меню и Ctrl+Q всегда завершают плеер; «Выйти» рядом с аккаунтом означает выход из аккаунта.\n\nВ меню ⋮ можно установить таймер сна на 15, 30 или 60 минут. Оставшееся время видно внизу окна; «Отменить таймер» отключает его. По окончании музыка останавливается. Таймер действует только в текущем сеансе."),
-            ("Горячие клавиши", "Пробел — воспроизведение / пауза.\nCtrl + ← / → — предыдущий / следующий трек.\nAlt + ← / → — назад / вперёд на 5 секунд.\nCtrl + ↑ / ↓ — громкость ±5%.\nCtrl + M — выключить / включить звук.\nCtrl + F — поиск музыки.\nCtrl + R или F5 — обновить текущий список.\nCtrl + Q — выйти из Impuls.\nF1 — открыть эту справку.\n\nКлавиши воспроизведения не мешают редактированию текста. Системные медиаклавиши работают через MPRIS."),
+            ("Горячие клавиши", "Пробел — воспроизведение / пауза.\nCtrl + ← / → — предыдущий / следующий трек.\nAlt + ← / → — назад / вперёд на 5 секунд.\nCtrl + ↑ / ↓ — громкость ±5%.\nCtrl + M — выключить / включить звук.\nCtrl+Shift+M — мини-плеер / полный вид.\nCtrl + J — к играющему треку.\nCtrl + B — отметить момент.\nCtrl + F — поиск музыки.\nCtrl + R или F5 — обновить текущий список.\nCtrl + Q — выйти из Impuls.\nF1 — открыть эту справку.\n\nКлавиши воспроизведения не мешают редактированию текста. Системные медиаклавиши работают через MPRIS."),
             ("Если что-то не работает", "Нет звука: проверьте громкость плеера, выбранное аудиоустройство и системный микшер. Если трек недоступен, проверьте соединение и доступ к нему в Яндекс Музыке. Обновите список кнопкой ↻ или Ctrl+R.\n\nНет эквалайзера или визуализации: установите пакет gstreamer1-plugins-good и перезапустите плеер. Нет трея: нужен совместимый StatusNotifierHost; в GNOME может потребоваться расширение AppIndicator.\n\nНе сохраняется вход: проверьте, что системное хранилище секретов запущено и разблокировано. Настройки не сохраняются: проверьте права записи в каталог конфигурации.\n\nЕсли ошибка повторяется, откройте раздел Issues по ссылке ниже. Укажите версию Impuls, систему, шаги воспроизведения и текст ошибки без токенов и личных данных."),
         )
         sections = []
@@ -570,7 +758,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _show_shortcuts(self) -> None:
         window, content = self._modal("Горячие клавиши")
         content.append(_label("Управляйте музыкой с клавиатуры", "dialog-title"))
-        for keys, description in (("Пробел", "Воспроизведение / пауза"), ("Ctrl + ← / →", "Предыдущий / следующий трек"), ("Alt + ← / →", "Назад / вперёд на 5 секунд"), ("Ctrl + ↑ / ↓", "Громкость ±5%"), ("Ctrl + F", "Поиск музыки"), ("Ctrl + R / F5", "Обновить текущий список"), ("Ctrl + M", "Выключить / включить звук"), ("Ctrl + Q", "Выйти из Impuls"), ("F1", "Справка и о программе")):
+        for keys, description in (("Пробел", "Воспроизведение / пауза"), ("Ctrl + ← / →", "Предыдущий / следующий трек"), ("Alt + ← / →", "Назад / вперёд на 5 секунд"), ("Ctrl + ↑ / ↓", "Громкость ±5%"), ("Ctrl + F", "Поиск музыки"), ("Ctrl + R / F5", "Обновить текущий список"), ("Ctrl + M", "Выключить / включить звук"), ("Ctrl+Shift+M", "Мини-плеер / полный вид"), ("Ctrl + J", "К играющему треку"), ("Ctrl + B", "Отметить момент"), ("Ctrl + Q", "Выйти из Impuls"), ("F1", "Справка и о программе")):
             line = _box(Gtk.Orientation.HORIZONTAL, 20)
             key = _label(keys, "shortcut-key")
             key.set_width_chars(15)
@@ -914,6 +1102,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.shuffle_all_button.set_tooltip_text("Воспроизвести текущий список в случайном порядке")
         self.shuffle_all_button.connect("clicked", lambda _: self._call("play_all", True))
         list_actions.append(self.shuffle_all_button)
+        self.list_summary_label = _label("", "status-text", xalign=1)
+        self.list_summary_label.set_hexpand(True)
+        self.list_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.list_summary_label.set_width_chars(1)
+        self._update_list_summary()
+        list_actions.append(self.list_summary_label)
         library.append(list_actions)
 
         self.stack = Gtk.Stack()
@@ -1037,6 +1231,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         control = bool(state & Gdk.ModifierType.CONTROL_MASK)
         extra = state & (Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.META_MASK)
         if control and not extra and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.set_mini_mode(False)
             self.view_stack.set_visible_child_name("library")
             self.search_entry.grab_focus()
             return True
@@ -1051,11 +1246,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return True
         if self._focus_is_editable():
             return False
+        if control and not extra and state & Gdk.ModifierType.SHIFT_MASK and keyval in (Gdk.KEY_m, Gdk.KEY_M):
+            self.set_mini_mode(not self._mini_mode)
+            return True
+        if control and not extra and keyval in (Gdk.KEY_j, Gdk.KEY_J):
+            self.jump_to_current()
+            return True
+        if control and not extra and keyval in (Gdk.KEY_b, Gdk.KEY_B):
+            self._add_moment()
+            return True
         if state == Gdk.ModifierType.ALT_MASK and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
             if self._duration_ms <= 0:
                 return False
             delta = -5000 if keyval == Gdk.KEY_Left else 5000
-            self._call("seek", min(1.0, max(0.0, (self._position_ms + delta) / self._duration_ms)))
+            self._seek_to(min(1.0, max(0.0, (self._position_ms + delta) / self._duration_ms)))
             return True
         if control and not extra and keyval in (Gdk.KEY_Up, Gdk.KEY_Down):
             delta = 0.05 if keyval == Gdk.KEY_Up else -0.05
@@ -1098,8 +1302,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._call("open_playlist", playlist)
 
     def _on_seek(self, _scale: Gtk.Scale, _scroll: Gtk.ScrollType, value: float) -> bool:
-        self._call("seek", min(1.0, max(0.0, value)))
+        self._seek_to(min(1.0, max(0.0, value)))
         return False
+
+    def _seek_to(self, fraction: float) -> None:
+        position = self._call("seek", fraction)
+        if type(position) is int and position >= 0:
+            self._position_ms = position
+            self._refresh_clock()
+            if self._duration_ms > 0:
+                self.seek_scale.set_value(min(1.0, position / self._duration_ms))
 
     def _on_account_clicked(self, _button: Gtk.Button) -> None:
         if self._account is not None:
@@ -1264,6 +1476,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._highlighted_row = None
         self._selected_track_index = None
         self._rendered_track_count = 0
+        self._loaded_duration_ms = 0
+        self._unknown_duration_count = 0
 
     def _replace_playlists_list(self) -> None:
         old = self.playlists_list
@@ -1331,10 +1545,28 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._auto_more_layout_retries = 0
         start = self._rendered_track_count
         self._rendered_track_count += len(page)
+        for track in page:
+            duration = track.duration_ms or 0
+            if duration > 0:
+                self._loaded_duration_ms += duration
+            else:
+                self._unknown_duration_count += 1
+        self._update_list_summary()
         self.play_all_button.set_sensitive(self._rendered_track_count > 0)
         self.shuffle_all_button.set_sensitive(self._rendered_track_count > 0)
         self._render_queue.extend((start + offset, item) for offset, item in enumerate(page))
         self._schedule_render()
+
+    def _update_list_summary(self) -> None:
+        duration = _format_time(self._loaded_duration_ms)
+        suffix = "+" if self._unknown_duration_count else ""
+        summary = f"Загружено: {self._rendered_track_count} · {duration}{suffix}"
+        self.list_summary_label.set_label(summary)
+        self.list_summary_label.set_visible(True)
+        tooltip = f"{summary}\nСуммарная длительность загруженных треков; следующие страницы не учтены."
+        if self._unknown_duration_count:
+            tooltip += f"\n+ — длительность части треков неизвестна ({self._unknown_duration_count}); показана только известная сумма."
+        self.list_summary_label.set_tooltip_text(tooltip)
 
     def _append_track_row(self, index: int, track) -> None:
         row = Gtk.ListBoxRow()
@@ -1428,6 +1660,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._cancel_render()
         self._replace_playlists_list()
         self._render_kind = "playlists"
+        self.list_summary_label.set_label("")
+        self.list_summary_label.set_visible(False)
+        self.list_summary_label.set_tooltip_text(None)
         self.play_all_button.set_sensitive(False)
         self.shuffle_all_button.set_sensitive(False)
         self.heading_label.set_label("Плейлисты")
@@ -1532,6 +1767,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._destroyed:
             return
         self._destroyed = True
+        if self._geometry_tick_id:
+            self.remove_tick_callback(self._geometry_tick_id)
+            self._geometry_tick_id = 0
+        if self._jump_tick_id:
+            self.remove_tick_callback(self._jump_tick_id)
+            self._jump_tick_id = 0
         self._close_help_window()
         self._cancel_render()
         if self._dispose_source_id:
@@ -1563,6 +1804,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def set_now_playing(self, track, index: int | None = None) -> None:
         self.set_stream_quality(None, None)
         self._current_track = track
+        self.moment_add_button.set_sensitive(False)
+        self._render_moments()
         if index is not None:
             self._selected_track_index = index
         elif track is None:
@@ -1608,14 +1851,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def set_playback(self, playing: bool, position_ms: int = 0, duration_ms: int = 0) -> None:
         self._position_ms = max(0, position_ms)
         self._duration_ms = max(0, duration_ms)
+        self.moment_add_button.set_sensitive(self._current_track is not None and self._duration_ms > 0)
         self.play_button.set_icon_name("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic")
         tooltip = "Пауза" if playing else "Воспроизвести"
         self.play_button.set_tooltip_text(tooltip)
         self.play_button.update_property([Gtk.AccessibleProperty.LABEL], [tooltip])
-        self.position_label.set_label(_format_time(position_ms))
+        self._refresh_clock()
         self.duration_label.set_label(_format_time(duration_ms))
         self.seek_scale.set_sensitive(duration_ms > 0)
         self.seek_scale.set_value(min(1.0, max(0.0, position_ms / duration_ms)) if duration_ms > 0 else 0)
+
+    def _refresh_clock(self) -> None:
+        if self.time_toggle.get_active():
+            text = "−" + _format_time(max(0, self._duration_ms - self._position_ms)) if self._duration_ms else "−−:−−"
+        else:
+            text = _format_time(self._position_ms)
+        self.position_label.set_label(text)
+        self.position_label.update_property([Gtk.AccessibleProperty.LABEL],
+                                           ["Оставшееся время" if self.time_toggle.get_active() else "Прошедшее время"])
 
     def show_error(self, message: str) -> None:
         if self._error_window is not None:

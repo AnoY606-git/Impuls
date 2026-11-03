@@ -147,6 +147,7 @@ class ApplicationSmokeTests(unittest.TestCase):
                 assert values['shuffle'] and values['repeat'], values
                 assert values['equalizer_expanded'], values
                 assert values['window_size'] == (1000, 720), values
+                assert values['show_remaining'], values
             with patch('impuls_player.app.SecretStore', return_value=Store()):
                 app = ImpulsApplication()
                 app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
@@ -173,6 +174,8 @@ class ApplicationSmokeTests(unittest.TestCase):
                                 assert app.controller.repeat_enabled
                                 assert win.equalizer_toggle.get_active()
                                 assert tuple(win.get_default_size()) == (1000, 720)
+                                assert win.time_toggle.get_active()
+                                assert not win.mini_button.get_active()
                                 app.request_quit()
                             else:
                                 win.volume_scale.set_value(.31)
@@ -183,6 +186,8 @@ class ApplicationSmokeTests(unittest.TestCase):
                                 win.repeat_button.set_active(True)
                                 win.equalizer_toggle.set_active(True)
                                 win.set_default_size(1000, 720)
+                                win.time_toggle.set_active(True)
+                                win.set_mini_mode(True)
                                 if phase == 'autosave':
                                     GLib.timeout_add(900, verify_open)
                                 elif phase == 'tray':

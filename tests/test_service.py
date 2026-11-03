@@ -77,6 +77,38 @@ class MusicServiceTests(unittest.TestCase):
             with self.subTest(uid=uid), self.assertRaises(ServiceError):
                 self.service.connect()
 
+    def test_playlist_response_started_before_refresh_cannot_cache_stale_entries(self):
+        self.service.connect()
+        playlist = Playlist('1', 'Playlist', '42')
+
+        def old_response(*args, **kwargs):
+            self.service.invalidate_cache()
+            return NS(tracks=[NS(track=api_track('12', 'Old'))])
+
+        self.client.users_playlists.side_effect = old_response
+        old_tracks, _ = self.service.playlist_tracks_page(playlist, snapshot=CollectionSnapshot())
+        self.assertEqual(old_tracks[0].title, 'Old')
+        self.client.users_playlists.side_effect = None
+        self.client.users_playlists.return_value = NS(tracks=[NS(track=api_track('20', 'Fresh'))])
+        fresh_tracks, _ = self.service.playlist_tracks_page(playlist, snapshot=CollectionSnapshot())
+        self.assertEqual(fresh_tracks[0].title, 'Fresh')
+
+    def test_metadata_response_started_before_refresh_cannot_cache_stale_track(self):
+        self.service.connect()
+        self.client.users_likes_tracks.return_value = NS(tracks_ids=['12'])
+
+        def old_response(identifiers):
+            self.service.invalidate_cache()
+            return [api_track('12', 'Old')]
+
+        self.client.tracks.side_effect = old_response
+        old_tracks, _ = self.service.liked_tracks_page(snapshot=CollectionSnapshot())
+        self.assertEqual(old_tracks[0].title, 'Old')
+        self.client.tracks.side_effect = None
+        self.client.tracks.return_value = [api_track('12', 'Fresh')]
+        fresh_tracks, _ = self.service.liked_tracks_page(snapshot=CollectionSnapshot())
+        self.assertEqual(fresh_tracks[0].title, 'Fresh')
+
     def test_playback_service_creates_separate_client_without_initializing_account(self):
         playback_client = MagicMock()
         playback_client.tracks_file_info.return_value = NS(

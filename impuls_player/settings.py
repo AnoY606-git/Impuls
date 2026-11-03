@@ -12,7 +12,7 @@ def _validated(values: object) -> dict:
     result = {'volume': .75, 'quality': 'hq', 'equalizer': (0.0,) * 10,
               'visualization': 'ribbons', 'shuffle': False, 'repeat': False,
               'equalizer_expanded': False, 'window_size': (960, 800),
-              'window_maximized': False}
+              'window_maximized': False, 'show_remaining': False}
     if not isinstance(values, dict):
         return result
     volume = values.get('volume')
@@ -29,7 +29,7 @@ def _validated(values: object) -> dict:
     mode = values.get('visualization')
     if isinstance(mode, str) and mode in ('ribbons', 'bars', 'mirror', 'orbit'):
         result['visualization'] = mode
-    for name in ('shuffle', 'repeat', 'equalizer_expanded', 'window_maximized'):
+    for name in ('shuffle', 'repeat', 'equalizer_expanded', 'window_maximized', 'show_remaining'):
         if type(values.get(name)) is bool:
             result[name] = values[name]
     size = values.get('window_size')

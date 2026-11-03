@@ -10,3 +10,6 @@ build/
 *.swp
 .env
 .env.*
+docs/reviews/
+docs/superpowers/
+.superpowers/
