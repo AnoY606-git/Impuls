@@ -6,7 +6,7 @@ imported lazily so that unit tests and non-network application startup are safe.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import logging
 import math
@@ -14,6 +14,8 @@ import time
 from numbers import Real
 import re
 import socket
+import threading
+from weakref import WeakKeyDictionary
 from typing import Callable, TypeVar
 from urllib.parse import urlsplit
 
@@ -21,6 +23,11 @@ from urllib.parse import urlsplit
 _TIMEOUT_SECONDS = 15
 _DEVICE_TIMEOUT_SECONDS = 300
 _BATCH_SIZE = 100
+_CACHE_SECONDS = 60
+_METADATA_CACHE_LIMIT = 5000
+_PLAYLIST_CACHE_LIMIT = 32
+_AUDIO_CODECS = frozenset(('flac', 'flac-mp4', 'aac', 'aac-mp4',
+                           'he-aac', 'he-aac-mp4', 'mp3'))
 _ID_RE = re.compile(r"^[0-9]+(?::[0-9]+)?$")
 _T = TypeVar("_T")
 
@@ -44,8 +51,22 @@ class Playlist:
     cover_url: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AudioStream:
+    """Resolved audio; bitrate is in kbit/s, or zero when not reported."""
+    url: str = field(repr=False)
+    codec: str
+    bitrate: int
+    quality: str
+
+
 class ServiceError(Exception):
     """A safe user-facing error that does not contain credentials or URLs."""
+
+
+class CollectionSnapshot:
+    """Identity for one view's stable sequence of paginated source entries."""
+    __slots__ = ('__weakref__',)
 
 
 def _new_client(token: str | None = None):
@@ -154,17 +175,21 @@ def _tracks(values: object) -> list[Track]:
     return [item for raw in (values or ()) if (item := _track(raw)) is not None]
 
 
-def _fetch_by_id(client: object, identifiers: list[str],
-                 should_cancel: Callable[[], bool] | None = None) -> dict[str, Track]:
-    """Resolve metadata in bounded batches, indexed by complete and bare ID."""
-    by_id: dict[str, Track] = {}
-    for start in range(0, len(identifiers), _BATCH_SIZE):
-        if should_cancel is not None and should_cancel():
-            raise ServiceError("Запрос отменён.")
-        for item in _tracks(client.tracks(identifiers[start:start + _BATCH_SIZE])):
-            by_id[item.id] = item
-            by_id.setdefault(item.id.split(":", 1)[0], item)
-    return by_id
+def _check_cancel(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise ServiceError("Запрос отменён.")
+
+
+def _page_bounds(offset: int, limit: int) -> None:
+    if (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+            or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _BATCH_SIZE):
+        raise ValueError("Неверные параметры страницы.")
+
+
+def _entry_id(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not _ID_RE.fullmatch(str(value)):
+        raise ServiceError("Сервис вернул некорректный идентификатор трека.")
+    return str(value)
 
 
 class MusicService:
@@ -176,6 +201,14 @@ class MusicService:
         self._token = token.strip()
         self._client = None
         self._uid = ""
+        self._cache_lock = threading.Lock()
+        self._likes_generation = 0
+        self._likes_cache: tuple[float, tuple[str, ...]] | None = None
+        self._likes_snapshot: tuple[str, ...] | None = None
+        self._playlists_cache: dict[tuple[str, str], tuple[float, tuple[object, ...]]] = {}
+        self._playlist_snapshots: dict[tuple[str, str], tuple[object, ...]] = {}
+        self._view_snapshots = WeakKeyDictionary()
+        self._metadata_cache: dict[str, tuple[float, Track]] = {}
 
     @staticmethod
     def device_login(
@@ -250,11 +283,32 @@ class MusicService:
             account = getattr(getattr(client, "me", None), "account", None)
             if account is None:
                 raise ServiceError("Не удалось получить данные аккаунта.")
-            self._uid = str(getattr(account, "uid", "") or "")
-            self._client = client
+            uid = getattr(account, "uid", None)
+            if isinstance(uid, bool) or not isinstance(uid, (str, int)) or not re.fullmatch(r"[0-9]+", str(uid)):
+                raise ServiceError("Сервис не вернул корректный идентификатор аккаунта.")
+            with self._cache_lock:
+                self._uid = str(uid)
+                self._client = client
+                self._likes_generation += 1
+                self._likes_cache = None
+                self._likes_snapshot = None
+                self._playlists_cache.clear()
+                self._playlist_snapshots.clear()
+                self._view_snapshots.clear()
+                self._metadata_cache.clear()
             return str(getattr(account, "login", None) or getattr(account, "display_name", None) or "Аккаунт Яндекса")
 
         return _safely("Не удалось войти. Проверьте токен и подключение к сети.", run)
+
+    def playback_service(self) -> MusicService:
+        """Create an independent authenticated transport for playback requests."""
+        self._connected()
+        def run() -> MusicService:
+            result = MusicService(self._token)
+            result._client = _new_client(self._token)
+            result._uid = self._uid
+            return result
+        return _safely("Не удалось подготовить воспроизведение.", run)
 
     def search(self, query: str) -> list[Track]:
         if not isinstance(query, str) or not query.strip():
@@ -265,29 +319,142 @@ class MusicService:
             return _tracks(getattr(getattr(result, "tracks", None), "results", None))
         return _safely("Не удалось выполнить поиск.", run)
 
-    def liked_tracks(self, should_cancel: Callable[[], bool] | None = None) -> list[Track]:
+    def _liked_ids(self, client: object, should_cancel: Callable[[], bool] | None) -> tuple[str, ...]:
+        _check_cancel(should_cancel)
+        with self._cache_lock:
+            cached, generation = self._likes_cache, self._likes_generation
+            if cached is not None and cached[0] > time.monotonic():
+                return cached[1]
+        liked = client.users_likes_tracks(user_id=self._uid)
+        _check_cancel(should_cancel)
+        values = getattr(liked, "tracks_ids", None)
+        if not isinstance(values, (list, tuple)):
+            raise ServiceError("Сервис вернул некорректный список любимых треков.")
+        identifiers = tuple(_entry_id(value) for value in values)
+        with self._cache_lock:
+            if client is self._client and generation == self._likes_generation:
+                self._likes_cache = (time.monotonic() + _CACHE_SECONDS, identifiers)
+        return identifiers
+
+    def _playlist_entries(self, client: object, owner: str, kind: str,
+                          should_cancel: Callable[[], bool] | None) -> tuple[object, ...]:
+        _check_cancel(should_cancel)
+        key = (owner, kind)
+        with self._cache_lock:
+            cached = self._playlists_cache.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                return cached[1]
+        data = client.users_playlists(kind, user_id=owner)
+        _check_cancel(should_cancel)
+        entries = getattr(data, "tracks", None)
+        if not isinstance(entries, (list, tuple)):
+            raise ServiceError("Сервис вернул некорректный список треков плейлиста.")
+        result = tuple(entries)
+        with self._cache_lock:
+            if client is self._client:
+                self._playlists_cache[key] = (time.monotonic() + _CACHE_SECONDS, result)
+                while len(self._playlists_cache) > _PLAYLIST_CACHE_LIMIT:
+                    self._playlists_cache.pop(next(iter(self._playlists_cache)))
+        return result
+
+    def _page_metadata(self, client: object, identifiers: list[str],
+                       should_cancel: Callable[[], bool] | None) -> dict[str, Track]:
+        """Resolve at most one page of IDs with a single network request."""
+        _check_cancel(should_cancel)
+        result: dict[str, Track] = {}
+        missing: list[str] = []
+        now = time.monotonic()
+        with self._cache_lock:
+            for identifier in dict.fromkeys(identifiers):
+                cached = self._metadata_cache.get(identifier)
+                if cached is not None and cached[0] > now:
+                    result[identifier] = cached[1]
+                else:
+                    self._metadata_cache.pop(identifier, None)
+                    missing.append(identifier)
+        if not missing:
+            return result
+        _check_cancel(should_cancel)
+        raw_tracks = client.tracks(missing)
+        _check_cancel(should_cancel)
+        if not isinstance(raw_tracks, (list, tuple)) or not raw_tracks:
+            raise ServiceError("Сервис не вернул данные запрошенных треков.")
+        returned: dict[str, Track] = {}
+        for raw in raw_tracks:
+            item = _track(raw)
+            if item is None:
+                raise ServiceError("Сервис вернул некорректные данные трека.")
+            returned[item.id] = item
+            returned.setdefault(item.id.split(":", 1)[0], item)
+        expires = time.monotonic() + _CACHE_SECONDS
+        for identifier in missing:
+            item = returned.get(identifier) or returned.get(identifier.split(":", 1)[0])
+            if item is not None:
+                result[identifier] = item
+        if not result:
+            raise ServiceError("Сервис не вернул данные запрошенных треков.")
+        with self._cache_lock:
+            if client is self._client:
+                for identifier in missing:
+                    if identifier in result:
+                        self._metadata_cache[identifier] = (expires, result[identifier])
+                while len(self._metadata_cache) > _METADATA_CACHE_LIMIT:
+                    self._metadata_cache.pop(next(iter(self._metadata_cache)))
+        return result
+
+    def liked_tracks_page(self, offset: int = 0, limit: int = 100,
+                          should_cancel: Callable[[], bool] | None = None, *,
+                          snapshot: CollectionSnapshot | None = None) -> tuple[list[Track], bool]:
+        """Load one page from the current view's stable source-entry snapshot."""
+        _page_bounds(offset, limit)
+        if snapshot is not None and not isinstance(snapshot, CollectionSnapshot):
+            raise ValueError("Неверный снимок коллекции.")
         client = self._connected()
-        def run() -> list[Track]:
-            liked = client.users_likes_tracks()
-            identifiers = [str(value) for value in (getattr(liked, "tracks_ids", None) or ())
-                           if _ID_RE.fullmatch(str(value))]
-            by_id = _fetch_by_id(client, identifiers, should_cancel)
-            return [item for value in identifiers
-                    if (item := by_id.get(value) or by_id.get(value.split(":", 1)[0])) is not None]
-        return _safely("Не удалось загрузить любимые треки.", run)
+        def run() -> tuple[list[Track], bool]:
+            _check_cancel(should_cancel)
+            key = ('likes',)
+            with self._cache_lock:
+                captured = self._view_snapshots.get(snapshot) if snapshot is not None else None
+                identifiers = ((captured[1] if captured and captured[0] == key else None)
+                               if snapshot is not None else self._likes_snapshot) if offset else None
+            if identifiers is None:
+                identifiers = self._liked_ids(client, should_cancel)
+                with self._cache_lock:
+                    if client is self._client:
+                        if snapshot is None:
+                            self._likes_snapshot = identifiers
+                        else:
+                            self._view_snapshots[snapshot] = (key, identifiers)
+            page = identifiers[offset:offset + limit]
+            by_id = self._page_metadata(client, list(page), should_cancel)
+            return [by_id[identifier] for identifier in page if identifier in by_id], offset + limit < len(identifiers)
+        return _safely("Не удалось загрузить любимые треки. Проверьте подключение.", run)
+
+    def liked_tracks(self, should_cancel: Callable[[], bool] | None = None) -> list[Track]:
+        result: list[Track] = []
+        offset = 0
+        while True:
+            page, more = self.liked_tracks_page(offset, _BATCH_SIZE, should_cancel)
+            result.extend(page)
+            if not more:
+                return result
+            offset += _BATCH_SIZE
 
     def playlists(self) -> list[Playlist]:
         client = self._connected()
         def run() -> list[Playlist]:
             result = []
-            for value in client.users_playlists_list() or []:
+            values = client.users_playlists_list(user_id=self._uid)
+            if not isinstance(values, (list, tuple)):
+                raise ServiceError("Сервис вернул некорректный список плейлистов.")
+            for value in values:
                 kind = getattr(value, "kind", None)
                 owner = getattr(value, "owner", None)
                 owner_uid = getattr(owner, "uid", None) or getattr(owner, "id", None) or self._uid
                 if kind is None or not owner_uid:
-                    continue
+                    raise ServiceError("Сервис вернул некорректный список плейлистов.")
                 if not _ID_RE.fullmatch(str(kind)) or not _ID_RE.fullmatch(str(owner_uid)):
-                    continue
+                    raise ServiceError("Сервис вернул некорректный список плейлистов.")
                 cover = getattr(value, "cover", None)
                 uri = getattr(cover, "uri", None) or getattr(value, "og_image", None)
                 count = getattr(value, "track_count", None)
@@ -299,42 +466,94 @@ class MusicService:
 
     def playlist_tracks(self, playlist: Playlist,
                         should_cancel: Callable[[], bool] | None = None) -> list[Track]:
+        result: list[Track] = []
+        offset = 0
+        while True:
+            page, more = self.playlist_tracks_page(playlist, offset, _BATCH_SIZE, should_cancel)
+            result.extend(page)
+            if not more:
+                return result
+            offset += _BATCH_SIZE
+
+    def playlist_tracks_page(self, playlist: Playlist, offset: int = 0, limit: int = 100,
+                             should_cancel: Callable[[], bool] | None = None, *,
+                             snapshot: CollectionSnapshot | None = None) -> tuple[list[Track], bool]:
+        """Load a playlist page using embedded data or a single metadata request."""
+        _page_bounds(offset, limit)
+        if snapshot is not None and not isinstance(snapshot, CollectionSnapshot):
+            raise ValueError("Неверный снимок коллекции.")
         client = self._connected()
         kind = _numeric_id(playlist.id)
         owner = _numeric_id(playlist.owner_uid)
-        def run() -> list[Track]:
-            data = client.users_playlists(kind, user_id=owner)
-            entries = getattr(data, "tracks", None) or []
-            missing = []
-            for entry in entries:
-                if getattr(entry, "track", None) is None:
-                    identifier = getattr(entry, "track_id", None)
-                    if identifier and _ID_RE.fullmatch(str(identifier)):
-                        missing.append(str(identifier))
-            by_id = _fetch_by_id(client, missing, should_cancel)
-            result = []
-            for entry in entries:
+        def run() -> tuple[list[Track], bool]:
+            _check_cancel(should_cancel)
+            key = (owner, kind)
+            snapshot_key = ('playlist', owner, kind)
+            with self._cache_lock:
+                captured = self._view_snapshots.get(snapshot) if snapshot is not None else None
+                entries = ((captured[1] if captured and captured[0] == snapshot_key else None)
+                           if snapshot is not None else self._playlist_snapshots.get(key)) if offset else None
+            if entries is None:
+                entries = self._playlist_entries(client, owner, kind, should_cancel)
+                with self._cache_lock:
+                    if client is self._client:
+                        if snapshot is not None:
+                            self._view_snapshots[snapshot] = (snapshot_key, entries)
+                        else:
+                            self._playlist_snapshots[key] = entries
+                            while len(self._playlist_snapshots) > _PLAYLIST_CACHE_LIMIT:
+                                self._playlist_snapshots.pop(next(iter(self._playlist_snapshots)))
+            page = entries[offset:offset + limit]
+            selected: list[tuple[Track | None, str | None]] = []
+            missing: list[str] = []
+            for entry in page:
                 item = _track(getattr(entry, "track", None))
-                if item is None:
-                    identifier = str(getattr(entry, "track_id", ""))
-                    item = by_id.get(identifier) or by_id.get(identifier.split(":", 1)[0])
-                if item:
-                    result.append(item)
-            return result
-        return _safely("Не удалось загрузить треки плейлиста.", run)
+                identifier = None if item is not None else _entry_id(getattr(entry, "track_id", None))
+                if identifier is not None:
+                    missing.append(identifier)
+                selected.append((item, identifier))
+            by_id = self._page_metadata(client, missing, should_cancel)
+            result = []
+            for item, identifier in selected:
+                track = item if item is not None else by_id.get(identifier)
+                if track is not None:
+                    result.append(track)
+            return result, offset + limit < len(entries)
+        return _safely("Не удалось загрузить треки плейлиста. Проверьте подключение.", run)
 
-    def stream_url(self, track: Track) -> str:
+    def stream_info(self, track: Track, quality: str = 'hq') -> AudioStream:
+        """Resolve a raw stream and report the actual delivered format."""
+        if not isinstance(quality, str) or quality not in ('nq', 'hq', 'lossless'):
+            raise ValueError("Неверное качество аудио.")
         client = self._connected()
         identifier = _numeric_id(track.id)
-        def run() -> str:
-            # The current API returns a direct link for unencrypted `raw` files.
+        def bitrate(value: object) -> int:
+            return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 100000 else 0
+        def actual_quality(codec: str, rate: int, declared: object) -> str:
+            # Some accounts return quality=lossless for an AAC fallback. Only
+            # FLAC can be reported as lossless; an unknown rate stays unknown.
+            if codec in ('flac', 'flac-mp4'):
+                return 'lossless'
+            if declared in ('nq', 'hq'):
+                return declared
+            if rate:
+                return 'hq' if rate >= 256 else 'nq'
+            return 'unknown'
+        def run() -> AudioStream:
+            # Upstream's default codec list covers the supported raw formats.
             try:
-                file_info = client.tracks_file_info(identifier, quality="hq", codecs=["mp3", "aac"], transport="raw")
+                file_info = client.tracks_file_info(identifier, quality=quality, transport="raw")
                 info = getattr(file_info, "download_info", None)
-                url = _music_url(getattr(info, "url", None))
-                if (info is not None and getattr(info, "transport", None) == "raw"
-                        and getattr(info, "codec", None) in ("mp3", "aac") and url):
-                    return url
+                codec = getattr(info, 'codec', None)
+                if info is not None and getattr(info, 'transport', None) == 'raw' and codec in _AUDIO_CODECS:
+                    alternatives = getattr(info, 'urls', None)
+                    urls = [getattr(info, 'url', None)]
+                    if isinstance(alternatives, (list, tuple)):
+                        urls.extend(alternatives)
+                    url = next((safe for item in urls if (safe := _music_url(item))), None)
+                    if url:
+                        rate = bitrate(getattr(info, 'bitrate', None))
+                        return AudioStream(url, codec, rate, actual_quality(codec, rate, getattr(info, 'quality', None)))
             except Exception:
                 # Older clients/accounts may still expose the legacy endpoint.
                 pass
@@ -342,13 +561,26 @@ class MusicService:
             candidates = [c for c in candidates if getattr(c, "codec", "") == "mp3"
                           and not getattr(c, "preview", False)
                           and _music_url(getattr(c, "download_info_url", None))]
-            candidates.sort(key=lambda item: getattr(item, "bitrate_in_kbps", 0) or 0, reverse=True)
+            if quality == 'nq':
+                def normal_order(item):
+                    rate = bitrate(getattr(item, 'bitrate_in_kbps', None))
+                    return (0, -rate) if 0 < rate <= 192 else (1, rate or 100001)
+                candidates.sort(key=normal_order)
+            else:
+                candidates.sort(key=lambda item: bitrate(getattr(item, 'bitrate_in_kbps', None)), reverse=True)
             for candidate in candidates:
-                url = _music_url(candidate.get_direct_link(allow_redirects=False))
+                try:
+                    url = _music_url(candidate.get_direct_link(allow_redirects=False))
+                except Exception:
+                    continue
                 if url:
-                    return url
+                    rate = bitrate(getattr(candidate, 'bitrate_in_kbps', None))
+                    return AudioStream(url, 'mp3', rate, actual_quality('mp3', rate, None))
             raise ServiceError("Трек недоступен для воспроизведения в этом аккаунте.")
         return _safely("Не удалось получить аудиопоток. Проверьте доступность трека.", run)
+
+    def stream_url(self, track: Track) -> str:
+        return self.stream_info(track).url
 
     def set_liked(self, track: Track, liked: bool) -> None:
         client = self._connected()
@@ -357,4 +589,10 @@ class MusicService:
             method = client.users_likes_tracks_add if liked else client.users_likes_tracks_remove
             if not method(identifier):
                 raise ServiceError("Не удалось изменить отметку «Мне нравится».")
-        _safely("Не удалось изменить отметку «Мне нравится».", run)
+        try:
+            _safely("Не удалось изменить отметку «Мне нравится».", run)
+        finally:
+            # The server may have applied a change even when its response failed.
+            with self._cache_lock:
+                self._likes_generation += 1
+                self._likes_cache = None

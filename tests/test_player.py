@@ -1,14 +1,18 @@
 import array
+import io
 import math
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import wave
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from impuls_player.player import AudioPlayer, safe_stream_url
 
 try:
@@ -58,6 +62,464 @@ class NetworkSourceTests(unittest.TestCase):
                 self.assertEqual(source.get_property('timeout'), 15)
                 self.assertTrue(source.get_property('ssl-strict'))
                 self.assertFalse(source.get_property('automatic-redirect'))
+
+
+@unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+class ResumePlaybackTests(unittest.TestCase):
+    def make_player(self):
+        gst, pipeline = EqualizerTests.fake_gst(None)
+        for name in ('MessageType', 'State', 'StateChangeReturn', 'SeekFlags', 'Format', 'MSECOND'):
+            setattr(gst, name, getattr(Gst, name))
+        pipeline.set_state.return_value = Gst.StateChangeReturn.ASYNC
+        pipeline.seek_simple.return_value = True
+        errors = []
+        player = AudioPlayer(lambda: None, lambda: errors.append(True), lambda _playing: None, gst=gst)
+        self.addCleanup(player.close)
+        message = SimpleNamespace(type=Gst.MessageType.ASYNC_DONE, src=pipeline)
+        return player, pipeline, message, errors
+
+    def test_resume_prerolls_then_seeks_before_playing(self):
+        player, pipeline, message, errors = self.make_player()
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PAUSED,))
+        self.assertTrue(player.playing)
+        pipeline.seek_simple.assert_not_called()
+        player._on_message(None, message)
+        pipeline.seek_simple.assert_called_once_with(
+            Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, 3500 * Gst.MSECOND)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PAUSED,))
+        player._on_message(None, message)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PLAYING,))
+        self.assertEqual(errors, [])
+
+    def test_resume_respects_pause_and_cancels_on_stop_or_new_source(self):
+        player, pipeline, message, _errors = self.make_player()
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        player.toggle()
+        player._on_message(None, message)
+        player._on_message(None, message)
+        self.assertFalse(player.playing)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PAUSED,))
+        pipeline.seek_simple.reset_mock()
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        player.stop()
+        player._on_message(None, message)
+        pipeline.seek_simple.assert_not_called()
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        player.play_url('https://s50vla.storage.yandex.net/next')
+        player._on_message(None, message)
+        pipeline.seek_simple.assert_not_called()
+
+    def test_failed_resume_seek_reports_error_instead_of_playing_from_start(self):
+        player, pipeline, message, errors = self.make_player()
+        pipeline.seek_simple.return_value = False
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        player._on_message(None, message)
+        self.assertEqual(errors, [True])
+        self.assertFalse(player.has_source)
+        self.assertFalse(player.playing)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.NULL,))
+
+    def test_user_seek_cancels_the_pending_resume_seek(self):
+        player, pipeline, message, _errors = self.make_player()
+        pipeline.query_duration.return_value = (True, 5000 * Gst.MSECOND)
+        pipeline.query_position.return_value = (True, 0)
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3500)
+        self.assertEqual(player.position(), (3500, 5000))
+        self.assertEqual(player.seek(0.5), 2500)
+        self.assertEqual(player.position(), (2500, 5000))
+        pipeline.seek_simple.assert_not_called()
+        player._on_message(None, message)
+        pipeline.seek_simple.assert_called_once_with(
+            Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, 2500 * Gst.MSECOND)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PAUSED,))
+        player._on_message(None, message)
+        pipeline.seek_simple.assert_called_once()
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PLAYING,))
+
+    def test_seek_during_an_inflight_seek_waits_for_its_own_completion(self):
+        player, pipeline, message, _errors = self.make_player()
+        pipeline.query_duration.return_value = (True, 8000 * Gst.MSECOND)
+        pipeline.query_position.return_value = (True, 0)
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3000)
+        player._on_message(None, message)  # Start the recovery seek.
+        self.assertEqual(player.seek(0.75), 6000)
+        self.assertEqual(player.position(), (6000, 8000))
+        self.assertEqual(pipeline.seek_simple.call_count, 1)
+        player._on_message(None, message)  # Finish recovery; begin the user seek.
+        self.assertEqual(pipeline.seek_simple.call_count, 2)
+        self.assertEqual(pipeline.seek_simple.call_args.args[-1], 6000 * Gst.MSECOND)
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PAUSED,))
+        player._on_message(None, message)  # Only the new seek may resume playback.
+        self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.PLAYING,))
+
+    def test_seek_returns_none_when_duration_is_not_known(self):
+        player, pipeline, message, _errors = self.make_player()
+        pipeline.query_duration.return_value = (False, 0)
+        player.play_url('https://s50vla.storage.yandex.net/audio', start_ms=3000)
+        self.assertIsNone(player.seek(0.5))
+        player._on_message(None, message)
+        self.assertEqual(pipeline.seek_simple.call_args.args[-1], 3000 * Gst.MSECOND)
+
+    def test_real_playbin_user_seek_resumes_at_the_requested_position(self):
+        if any(Gst.ElementFactory.find(name) is None for name in ('wavparse', 'fdsrc', 'fakesink')):
+            self.skipTest('GStreamer plugins needed for this integration test are unavailable')
+        wav_bytes = io.BytesIO()
+        with wave.open(wav_bytes, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(48000)
+            wav.writeframes(array.array('h', [1500] * (48000 * 5)).tobytes())
+        loop, errors = GLib.MainLoop(), []
+        player = AudioPlayer(lambda: loop.quit(), lambda: (errors.append(True), loop.quit()), lambda _playing: None)
+        sink = Gst.ElementFactory.make('fakesink')
+        sink.set_property('sync', True)
+        sink.set_property('signal-handoffs', True)
+        player._player.set_property('audio-sink', sink)
+        result = {'target': None, 'pts': None}
+        def handoff(_sink, buffer, _pad):
+            if result['target'] is not None and result['pts'] is None:
+                result['pts'] = buffer.pts // Gst.MSECOND
+                GLib.idle_add(loop.quit)
+        sink.connect('handoff', handoff)
+        def poll():
+            if result['target'] is None and player.position()[0] >= 400:
+                result['target'] = player.seek(0.5)
+            return True
+        poll_id = GLib.timeout_add(100, poll)
+        deadline = GLib.timeout_add(5000, lambda: (loop.quit(), False)[1])
+        try:
+            player.play_buffer(wav_bytes.getvalue())
+            loop.run()
+            self.assertEqual(errors, [])
+            self.assertEqual(result['target'], 2500)
+            self.assertIsNotNone(result['pts'])
+            self.assertGreaterEqual(result['pts'], 2400)
+        finally:
+            GLib.source_remove(poll_id)
+            if result['pts'] is not None:
+                GLib.source_remove(deadline)
+            player.close()
+
+    def test_stalled_http_stream_resumes_at_last_position_without_playing_its_start(self):
+        if any(Gst.ElementFactory.find(name) is None for name in ('wavparse', 'souphttpsrc', 'fakesink')):
+            self.skipTest('GStreamer plugins needed for this integration test are unavailable')
+        wav_bytes = io.BytesIO()
+        with wave.open(wav_bytes, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(48000)
+            wav.writeframes(array.array('h', [1500] * (48000 * 6)).tobytes())
+        data = wav_bytes.getvalue()
+        release = threading.Event()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.headers.get('Range'))
+                start = 0
+                header = self.headers.get('Range')
+                if header and header.startswith('bytes='):
+                    start = int(header[6:].split('-')[0])
+                self.send_response(206 if start else 200)
+                self.send_header('Content-Type', 'audio/wav')
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Content-Length', str(len(data) - start))
+                if start:
+                    self.send_header('Content-Range', f'bytes {start}-{len(data) - 1}/{len(data)}')
+                self.end_headers()
+                try:
+                    if len(requests) == 1:
+                        self.wfile.write(data[:96044])
+                        self.wfile.flush()
+                        release.wait(10)
+                    else:
+                        self.wfile.write(data[start:])
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *_args):
+                pass
+
+        try:
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        except OSError:
+            self.skipTest('Local TCP server is not available in this environment')
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        loop, errors = GLib.MainLoop(), []
+        player = AudioPlayer(lambda: loop.quit(), lambda: (errors.append(True), loop.quit()), lambda _playing: None)
+        sink = Gst.ElementFactory.make('fakesink')
+        sink.set_property('sync', True)
+        sink.set_property('signal-handoffs', True)
+        player._player.set_property('audio-sink', sink)
+        observation = {'last': 0, 'changed_at': time.monotonic(), 'resume': None, 'first_pts': None}
+        def handoff(_sink, buffer, _pad):
+            if observation['resume'] is not None and observation['first_pts'] is None:
+                observation['first_pts'] = buffer.pts // Gst.MSECOND
+                GLib.idle_add(loop.quit)
+        sink.connect('handoff', handoff)
+        uri = f'http://127.0.0.1:{server.server_port}/audio.wav'
+        def observe():
+            position, _duration = player.position()
+            if position > observation['last']:
+                observation['last'] = position
+                observation['changed_at'] = time.monotonic()
+            elif (position >= 400 and observation['resume'] is None
+                  and time.monotonic() - observation['changed_at'] >= 0.5):
+                observation['resume'] = position
+                player._start_source(uri, True, network=True, start_ms=position)
+            return True
+        poll = GLib.timeout_add(100, observe)
+        deadline = GLib.timeout_add(7000, lambda: (loop.quit(), False)[1])
+        try:
+            player._start_source(uri, True, network=True)
+            loop.run()
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(observation['resume'], 'The first HTTP response must actually stall')
+            self.assertIsNotNone(observation['first_pts'], 'The replacement source must produce audio')
+            self.assertGreaterEqual(observation['first_pts'], observation['resume'] - 100,
+                                    'Recovery must not play the beginning of the track')
+            self.assertGreaterEqual(len(requests), 2)
+        finally:
+            release.set()
+            GLib.source_remove(poll)
+            if observation['first_pts'] is not None:
+                GLib.source_remove(deadline)
+            player.close()
+            server.shutdown()
+            server.server_close()
+
+
+class PrefetchedPlaybackTests(unittest.TestCase):
+    @unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+    def test_network_read_ahead_has_a_bounded_memory_queue_without_download_mode(self):
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None)
+        try:
+            self.assertEqual(player._player.get_property('buffer-size'), 64 * 1024 * 1024)
+            self.assertEqual(player._player.get_property('buffer-duration'), 0)
+            self.assertFalse(int(player._player.get_property('flags')) & 0x80,
+                             'download mode creates a disk cache')
+        finally:
+            player.close()
+
+    @unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+    def test_complete_network_source_can_read_a_long_mp3_ahead_without_disk_cache(self):
+        if any(Gst.ElementFactory.find(name) is None for name in ('lamemp3enc', 'appsink', 'souphttpsrc', 'fakesink')):
+            self.skipTest('GStreamer plugins needed for this integration test are unavailable')
+        encoder = Gst.parse_launch(
+            'audiotestsrc samplesperbuffer=4800 num-buffers=1200 ! '
+            'audio/x-raw,rate=48000,channels=2 ! '
+            'lamemp3enc target=bitrate bitrate=192 cbr=true ! appsink name=sink sync=false')
+        sink = encoder.get_by_name('sink')
+        chunks = []
+        encoder.set_state(Gst.State.PLAYING)
+        try:
+            while True:
+                sample = sink.emit('try-pull-sample', 3 * Gst.SECOND)
+                if sample is None:
+                    break
+                buffer = sample.get_buffer()
+                chunks.append(buffer.extract_dup(0, buffer.get_size()))
+        finally:
+            encoder.set_state(Gst.State.NULL)
+        data = b''.join(chunks)
+        self.assertGreater(len(data), 2 * 1024 * 1024)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *_args):
+                pass
+
+        try:
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        except OSError:
+            self.skipTest('Local TCP server is not available in this environment')
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        loop, complete = GLib.MainLoop(), []
+        player = AudioPlayer(lambda: None, lambda: loop.quit(), lambda playing: None,
+                             on_download_complete=lambda: (complete.append(True), loop.quit()))
+        audio_sink = Gst.ElementFactory.make('fakesink')
+        audio_sink.set_property('sync', True)
+        player._player.set_property('audio-sink', audio_sink)
+        timeout = GLib.timeout_add(5000, lambda: (loop.quit(), False)[1])
+        try:
+            # Internal entry point is used solely to test a local synthetic HTTP source;
+            # public play_url continues to reject loopback URLs.
+            player._start_source(f'http://127.0.0.1:{server.server_port}/audio', True, network=True)
+            loop.run()
+            self.assertEqual(complete, [True])
+            queues = []
+            iterator = player._player.iterate_recurse()
+            while True:
+                status, element = iterator.next()
+                if status != Gst.IteratorResult.OK:
+                    break
+                factory = element.get_factory()
+                if factory is not None and factory.get_name() == 'queue2':
+                    queues.append(element)
+            self.assertTrue(queues)
+            for queue in queues:
+                self.assertLessEqual(queue.get_property('max-size-bytes'), 64 * 1024 * 1024)
+                self.assertEqual(queue.get_property('max-size-time'), 0)
+                self.assertEqual(queue.get_property('max-size-buffers'), 0)
+                self.assertIsNone(queue.get_property('temp-template'))
+        finally:
+            if complete:
+                GLib.source_remove(timeout)
+            player.close()
+            server.shutdown()
+            server.server_close()
+
+    def test_buffer_uses_memfd_and_closes_it_on_stop_and_source_change(self):
+        gst, pipeline = EqualizerTests.fake_gst(None)
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None, gst=gst)
+        player.play_buffer(b'first')
+        first_uri = next(call.args[1] for call in pipeline.set_property.call_args_list
+                         if call.args[0] == 'uri')
+        first_fd = int(first_uri.removeprefix('fd://'))
+        self.assertEqual(os.pread(first_fd, 5, 0), b'first')
+        player.play_url('https://s50vla.storage.yandex.net/audio')
+        with self.assertRaises(OSError):
+            os.fstat(first_fd)
+        player.play_buffer(b'second', autoplay=False)
+        second_uri = [call.args[1] for call in pipeline.set_property.call_args_list
+                      if call.args[0] == 'uri'][-1]
+        second_fd = int(second_uri.removeprefix('fd://'))
+        self.assertFalse(player.playing)
+        player.stop()
+        with self.assertRaises(OSError):
+            os.fstat(second_fd)
+        player.close()
+
+    def test_buffer_validation_rejects_empty_oversized_or_wrong_type(self):
+        gst, _ = EqualizerTests.fake_gst(None)
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None, gst=gst)
+        with patch('impuls_player.player._MAX_BUFFER_BYTES', 3):
+            for value in (b'', b'abcd', 'audio', None):
+                with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
+                    player.play_buffer(value)
+        player.close()
+
+    def test_failed_pipeline_start_does_not_leak_memfd(self):
+        gst, pipeline = EqualizerTests.fake_gst(None)
+        pipeline.set_state.return_value = gst.StateChangeReturn.FAILURE
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None, gst=gst)
+        real_create = os.memfd_create
+        descriptors = []
+        def create(*args, **kwargs):
+            fd = real_create(*args, **kwargs)
+            descriptors.append(fd)
+            return fd
+        with patch('impuls_player.player.os.memfd_create', side_effect=create):
+            with self.assertRaises(RuntimeError):
+                player.play_buffer(b'audio')
+        with self.assertRaises(OSError):
+            os.fstat(descriptors[0])
+        player.close()
+
+    @unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+    def test_real_playbin_decodes_wav_bytes_from_memory(self):
+        if any(Gst.ElementFactory.find(name) is None for name in ('appsink', 'wavparse', 'fdsrc')):
+            self.skipTest('GStreamer plugins needed for this integration test are unavailable')
+        blob = io.BytesIO()
+        with wave.open(blob, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(48000)
+            wav.writeframes(array.array('h', [1500] * 4800).tobytes())
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None)
+        sink = Gst.ElementFactory.make('appsink', None)
+        sink.set_property('sync', False)
+        player._player.set_property('audio-sink', sink)
+        try:
+            player.play_buffer(blob.getvalue())
+            sample = sink.emit('try-pull-sample', 3 * Gst.SECOND)
+            self.assertIsNotNone(sample, 'playbin must decode audio from an in-memory descriptor')
+            self.assertGreater(sample.get_buffer().get_size(), 0)
+        finally:
+            player.close()
+
+    @unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+    def test_source_eos_callback_is_one_shot_and_invalidated_by_seek_or_stop(self):
+        gst, pipeline = EqualizerTests.fake_gst(None)
+        # Use real event enums and pad probe values while retaining a fake pipeline.
+        gst.PadProbeType = Gst.PadProbeType
+        gst.PadProbeReturn = Gst.PadProbeReturn
+        gst.EventType = Gst.EventType
+        callbacks, scheduled = [], []
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None,
+                             on_download_complete=lambda: callbacks.append('complete'), gst=gst)
+        source, pad = MagicMock(), MagicMock()
+        source.get_static_pad.return_value = pad
+        source.find_property.return_value = True
+        def idle_add(callback, *args):
+            scheduled.append((callback, args))
+            return 1
+        info = MagicMock()
+        info.get_event.return_value = Gst.Event.new_eos()
+        with patch.object(GLib, 'idle_add', side_effect=idle_add):
+            player.play_url('https://s50vla.storage.yandex.net/audio')
+            player._setup_download_monitor(None, source)
+            probe = pad.add_probe.call_args.args[1]
+            probe(pad, info)
+            probe(pad, info)
+            self.assertEqual(len(scheduled), 1)
+            callback, args = scheduled.pop()
+            callback(*args)
+            self.assertEqual(callbacks, ['complete'])
+
+            player.play_url('https://s50vla.storage.yandex.net/audio')
+            player._setup_download_monitor(None, source)
+            probe = pad.add_probe.call_args.args[1]
+            info.get_event.return_value = Gst.Event.new_seek(
+                1.0, Gst.Format.BYTES, Gst.SeekFlags.FLUSH,
+                Gst.SeekType.SET, 4, Gst.SeekType.NONE, -1)
+            probe(pad, info)  # A demuxer may seek even when the user did not.
+            info.get_event.return_value = Gst.Event.new_eos()
+            probe(pad, info)
+            self.assertEqual(scheduled, [])
+
+            player.play_url('https://s50vla.storage.yandex.net/audio')
+            player._setup_download_monitor(None, source)
+            probe = pad.add_probe.call_args.args[1]
+            probe(pad, info)
+            pipeline.query_duration.return_value = (True, 100)
+            player.seek(0.5)
+            callback, args = scheduled.pop()
+            callback(*args)
+            self.assertEqual(callbacks, ['complete'])
+
+            player.play_url('https://s50vla.storage.yandex.net/audio')
+            player._setup_download_monitor(None, source)
+            probe = pad.add_probe.call_args.args[1]
+            probe(pad, info)
+            player.stop()
+            callback, args = scheduled.pop()
+            callback(*args)
+            self.assertEqual(callbacks, ['complete'])
+        player.close()
+
+    @unittest.skipIf(Gst is None, 'GStreamer introspection unavailable')
+    def test_playing_complete_buffer_schedules_completion_on_main_context(self):
+        gst, _ = EqualizerTests.fake_gst(None)
+        callbacks, scheduled = [], []
+        player = AudioPlayer(lambda: None, lambda: None, lambda playing: None,
+                             on_download_complete=lambda: callbacks.append('complete'), gst=gst)
+        with patch.object(GLib, 'idle_add', side_effect=lambda callback, *args: scheduled.append((callback, args))):
+            player.play_buffer(b'complete file')
+            self.assertEqual(callbacks, [])
+            self.assertEqual(len(scheduled), 1)
+            callback, args = scheduled.pop()
+            callback(*args)
+            self.assertEqual(callbacks, ['complete'])
+        player.close()
 
 
 class EqualizerTests(unittest.TestCase):

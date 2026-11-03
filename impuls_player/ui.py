@@ -1,6 +1,7 @@
 """GTK presentation for Impuls. This module never performs network requests."""
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 import math
 from pathlib import Path
@@ -73,6 +74,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._current_track = None
         self._track_rows: dict[Gtk.ListBoxRow, tuple[object, int]] = {}
         self._playlist_rows: dict[Gtk.ListBoxRow, object] = {}
+        self._rows_by_track_id: dict[str, list[Gtk.ListBoxRow]] = {}
+        self._highlighted_row = None
+        self._selected_track_index: int | None = None
+        self._render_queue = deque()
+        self._render_source_id = 0
+        self._render_generation = 0
+        self._render_kind = "tracks"
+        self._rendered_track_count = 0
+        self._retired_lists = deque()
+        self._dispose_source_id = 0
+        self._pagination_has_more = False
+        self._pagination_loading = False
+        self._pagination_error = False
+        self._auto_more_empty_page = False
+        self._auto_more_source_id = 0
+        self._auto_more_layout_retries = 0
+        self._destroyed = False
+        self._compact_layout = None
         self._login_window: Gtk.Window | None = None
         self._device_window: Gtk.Window | None = None
         self._error_window: Gtk.Window | None = None
@@ -90,6 +109,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.set_size_request(480, 360)
         self._install_css()
         self._build()
+        self.connect("destroy", self._on_destroy)
+        self.connect("close-request", self._on_close_request)
 
     def _install_css(self) -> None:
         display = Gdk.Display.get_default()
@@ -105,8 +126,22 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if action is not None:
             action(*args)
 
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        compact = width < 600 or height < 500
+        if self._compact_layout != compact and hasattr(self, "equalizer_toggle"):
+            self._compact_layout = compact
+            self.equalizer_toggle.set_active(not compact)
+            for caption in self._compact_captions:
+                caption.set_visible(not compact)
+            if compact:
+                self._root_box.add_css_class("compact-layout")
+            else:
+                self._root_box.remove_css_class("compact-layout")
+        Gtk.ApplicationWindow.do_size_allocate(self, width, height, baseline)
+
     def _build(self) -> None:
         root = _box(Gtk.Orientation.VERTICAL, 5, "app-shell")
+        self._root_box = root
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroller.set_child(root)
@@ -137,12 +172,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
         button = Gtk.Button(label=label)
         button.add_css_class("nav-button")
         button.set_tooltip_text(label)
-        button.connect("clicked", lambda _: self._call(action))
+        button.connect("clicked", lambda _: self._navigate(action))
         return button
+
+    def _navigate(self, action: str) -> None:
+        self.view_stack.set_visible_child_name("library")
+        self._call(action)
 
     def _build_deck(self) -> Gtk.Box:
         deck = _box(Gtk.Orientation.VERTICAL, 4, "chrome-panel", "deck")
-        title = self._panel_title("IMPULS  •  ПРОИГРЫВАТЕЛЬ")
+        title = self._panel_title("IMPULS")
         title.get_first_child().set_hexpand(False)
         self.view_switcher = Gtk.StackSwitcher(stack=self.view_stack)
         self.view_switcher.add_css_class("view-switcher")
@@ -151,7 +190,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         title.append(self.view_switcher)
         self.account_label = _label("Гость", "title-account")
         self.account_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self.account_label.set_max_width_chars(24)
+        self.account_label.set_max_width_chars(12)
         title.append(self.account_label)
         self.account_button = Gtk.Button(label="Войти")
         self.account_button.add_css_class("title-button")
@@ -162,21 +201,31 @@ class PlayerWindow(Gtk.ApplicationWindow):
         display = _box(Gtk.Orientation.HORIZONTAL, 12, "led-display")
         clock = _box(Gtk.Orientation.VERTICAL, 0, "clock-display")
         clock.set_valign(Gtk.Align.CENTER)
-        clock.append(_label("ВРЕМЯ", "display-caption"))
+        clock_caption = _label("ВРЕМЯ", "display-caption")
+        clock.append(clock_caption)
         self.position_label = _label("0:00", "display-time")
+        self.position_label.update_property([Gtk.AccessibleProperty.LABEL], ["Текущая позиция"])
         self.position_label.set_width_chars(5)
         clock.append(self.position_label)
         display.append(clock)
         display_details = _box(Gtk.Orientation.VERTICAL, 3, "display-details")
         display_details.set_hexpand(True)
         display_details.set_valign(Gtk.Align.CENTER)
-        display_details.append(_label("ВОСПРОИЗВОДИТСЯ", "display-caption"))
+        playing_caption = _label("ВОСПРОИЗВОДИТСЯ", "display-caption")
+        display_details.append(playing_caption)
+        self._compact_captions = (clock_caption, playing_caption)
         self.now_title = _label("Ничего не играет", "now-title")
         self.now_title.set_ellipsize(Pango.EllipsizeMode.END)
         self.now_artist = _label("Выберите трек", "now-artist")
         self.now_artist.set_ellipsize(Pango.EllipsizeMode.END)
+        self.now_artist.set_hexpand(True)
         display_details.append(self.now_title)
-        display_details.append(self.now_artist)
+        display_meta = _box(Gtk.Orientation.HORIZONTAL, 8)
+        display_meta.append(self.now_artist)
+        self.stream_quality_label = _label("", "stream-quality", xalign=1)
+        self.stream_quality_label.set_visible(False)
+        display_meta.append(self.stream_quality_label)
+        display_details.append(display_meta)
         display.append(display_details)
         self.duration_label = _label("0:00", "display-duration", xalign=1)
         self.duration_label.set_width_chars(5)
@@ -234,17 +283,38 @@ class PlayerWindow(Gtk.ApplicationWindow):
         favorite_popover.set_child(favorite_actions)
         self.favorite_button.set_popover(favorite_popover)
         controls.append(self.favorite_button)
-        controls.append(_label("ГРОМКОСТЬ", "metal-caption"))
+        volume_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
+        volume_icon.set_tooltip_text("Громкость")
+        controls.append(volume_icon)
         self.volume_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.01)
-        self.volume_scale.set_size_request(105, -1)
+        self.volume_scale.set_size_request(80, -1)
         self.volume_scale.set_draw_value(False)
         self.volume_scale.set_value(0.75)
         self.volume_scale.set_tooltip_text("Громкость")
         self.volume_scale.update_property([Gtk.AccessibleProperty.LABEL], ["Громкость"])
         self.volume_scale.connect("value-changed", lambda scale: self._call("set_volume", scale.get_value()))
         controls.append(self.volume_scale)
+
+        self.quality_selector = Gtk.DropDown.new_from_strings(["NQ", "HQ", "Lossless"])
+        self.quality_selector.add_css_class("quality-selector")
+        self.quality_selector.set_tooltip_text("Качество следующих треков; текущий трек продолжит играть без изменений")
+        self.quality_selector.update_property([Gtk.AccessibleProperty.LABEL], ["Качество следующих треков"])
+        choices = ("Экономичное", "Высокое", "Lossless")
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _factory, item: item.set_child(Gtk.Label(xalign=0)))
+        factory.connect("bind", lambda _factory, item: item.get_child().set_text(choices[item.get_position()]))
+        self.quality_selector.set_list_factory(factory)
+        self.quality_selector.set_selected(1)
+        self.quality_selector.connect("notify::selected", self._on_quality_selected)
+        controls.append(self.quality_selector)
         deck.append(controls)
         return deck
+
+    def _on_quality_selected(self, selector: Gtk.DropDown, _param) -> None:
+        selected = selector.get_selected()
+        choices = ("nq", "hq", "lossless")
+        if selected < len(choices):
+            self._call("set_quality", choices[selected])
 
     def _build_equalizer(self) -> Gtk.Box:
         equalizer = _box(Gtk.Orientation.VERTICAL, 2, "chrome-panel", "equalizer")
@@ -254,6 +324,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.equalizer_hint.set_hexpand(True)
         self.equalizer_hint.set_ellipsize(Pango.EllipsizeMode.END)
         title.append(self.equalizer_hint)
+        self.equalizer_toggle = Gtk.ToggleButton(label="−")
+        self.equalizer_toggle.add_css_class("title-button")
+        self.equalizer_toggle.add_css_class("equalizer-toggle")
+        self.equalizer_toggle.set_active(True)
+        self.equalizer_toggle.set_tooltip_text("Свернуть эквалайзер")
+        self.equalizer_toggle.update_property([Gtk.AccessibleProperty.LABEL], ["Свернуть эквалайзер"])
+        self.equalizer_toggle.connect("toggled", self._on_equalizer_toggled)
+        title.append(self.equalizer_toggle)
         self._preset_names = list(EQUALIZER_PRESETS)
         self.preset_selector = Gtk.DropDown.new_from_strings(self._preset_names + ["Пользовательский"])
         self.preset_selector.add_css_class("preset-selector")
@@ -271,6 +349,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         equalizer.append(title)
 
         eq_body = _box(Gtk.Orientation.HORIZONTAL, 6, "equalizer-body")
+        self.equalizer_body = eq_body
         gauge = _box(Gtk.Orientation.VERTICAL, 0, "gain-gauge")
         gauge.append(_label("+12", "gain-label", xalign=1))
         upper_gap = Gtk.Box()
@@ -308,6 +387,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         equalizer.append(eq_body)
         self.set_equalizer_available(False)
         return equalizer
+
+    def _on_equalizer_toggled(self, toggle: Gtk.ToggleButton) -> None:
+        expanded = toggle.get_active()
+        self.equalizer_body.set_visible(expanded)
+        label = "Свернуть эквалайзер" if expanded else "Развернуть эквалайзер"
+        toggle.set_label("−" if expanded else "+")
+        toggle.set_tooltip_text(label)
+        toggle.update_property([Gtk.AccessibleProperty.LABEL], [label])
 
     def _reset_equalizer(self, _button: Gtk.Button) -> None:
         for slider in self.equalizer_sliders:
@@ -440,12 +527,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         with self._spectrum_lock:
             values, self._pending_spectrum = self._pending_spectrum, None
             self._spectrum_idle_pending = False
-        if values is not None:
+        if values is not None and not self._destroyed:
             self._apply_spectrum(values)
         return GLib.SOURCE_REMOVE
 
     def _apply_spectrum(self, values: tuple[float, ...]) -> None:
-        if not self._spectrum_available:
+        if self._destroyed or not self._spectrum_available:
             return
         was_active = any(self._spectrum_levels)
         self._spectrum_levels = values
@@ -527,17 +614,23 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.heading_label.set_ellipsize(Pango.EllipsizeMode.END)
         title.append(self.heading_label)
         library.append(title)
-        toolbar = _box(Gtk.Orientation.HORIZONTAL, 4, "library-toolbar")
+        toolbar = Gtk.FlowBox()
+        toolbar.add_css_class("library-toolbar")
+        toolbar.set_selection_mode(Gtk.SelectionMode.NONE)
+        toolbar.set_min_children_per_line(1)
+        toolbar.set_max_children_per_line(4)
+        toolbar.set_column_spacing(4)
+        toolbar.set_row_spacing(4)
+        toolbar.set_valign(Gtk.Align.START)
         self.wave_button = self._nav_button("Моя волна", "wave")
         self.liked_button = self._nav_button("Любимые треки", "liked_tracks")
         self.playlists_button = self._nav_button("Плейлисты", "playlists")
         toolbar.append(self.wave_button)
         toolbar.append(self.liked_button)
         toolbar.append(self.playlists_button)
-        toolbar.append(Gtk.Box(hexpand=True))
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Поиск музыки · Enter")
-        self.search_entry.set_size_request(180, -1)
+        self.search_entry.set_size_request(160, -1)
         self.search_entry.connect("activate", self._on_search)
         toolbar.append(self.search_entry)
         library.append(toolbar)
@@ -547,13 +640,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.stack.set_hexpand(True)
         self.stack.add_css_class("list-well")
         library.append(self.stack)
-        self.tracks_list = Gtk.ListBox()
-        self.tracks_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.tracks_list.add_css_class("music-list")
-        self.tracks_list.connect("row-activated", self._on_track_activated)
-        self.track_empty = _label("Войдите, чтобы найти музыку или открыть свою медиатеку.", "empty-state", xalign=0.5)
-        self.track_empty.set_wrap(True)
-        self.tracks_list.set_placeholder(self.track_empty)
+        self.tracks_list = self._new_tracks_list()
         track_page = _box(Gtk.Orientation.VERTICAL, 0)
         column_header = _box(Gtk.Orientation.HORIZONTAL, 8, "column-header")
         column_number = _label("№", "column-label", xalign=0.5)
@@ -573,25 +660,49 @@ class PlayerWindow(Gtk.ApplicationWindow):
         column_end.set_size_request(26, -1)
         column_header.append(column_end)
         track_page.append(column_header)
-        track_scroll = Gtk.ScrolledWindow()
-        track_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        track_scroll.set_vexpand(True)
-        track_scroll.set_child(self.tracks_list)
-        track_page.append(track_scroll)
+        self.track_scroll = Gtk.ScrolledWindow()
+        self.track_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.track_scroll.set_vexpand(True)
+        self.track_scroll.set_child(self.tracks_list)
+        adjustment = self.track_scroll.get_vadjustment()
+        adjustment.connect("value-changed", self._on_track_scroll)
+        adjustment.connect("changed", self._on_track_scroll)
+        self.track_scroll.connect("map", lambda _: self._schedule_auto_more())
+        track_page.append(self.track_scroll)
         self.stack.add_named(track_page, "tracks")
-        self.playlists_list = Gtk.ListBox()
-        self.playlists_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.playlists_list.add_css_class("music-list")
-        self.playlists_list.connect("row-activated", self._on_playlist_activated)
-        playlist_empty = _label("Здесь пока нет плейлистов.", "empty-state", xalign=0.5)
-        self.playlists_list.set_placeholder(playlist_empty)
-        playlist_scroll = Gtk.ScrolledWindow()
-        playlist_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        playlist_scroll.set_child(self.playlists_list)
-        self.stack.add_named(playlist_scroll, "playlists")
+        self.playlists_list = self._new_playlists_list()
+        self.playlist_scroll = Gtk.ScrolledWindow()
+        self.playlist_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.playlist_scroll.set_child(self.playlists_list)
+        self.stack.add_named(self.playlist_scroll, "playlists")
         self.stack.set_visible_child_name("tracks")
+        self.more_button = Gtk.Button(label="Показать ещё")
+        self.more_button.add_css_class("nav-button")
+        self.more_button.set_halign(Gtk.Align.CENTER)
+        self.more_button.set_tooltip_text("Загрузить следующую страницу")
+        self.more_button.set_visible(False)
+        self.more_button.connect("clicked", self._on_more_clicked)
+        library.append(self.more_button)
 
         return library
+
+    def _new_tracks_list(self) -> Gtk.ListBox:
+        tracks = Gtk.ListBox()
+        tracks.set_selection_mode(Gtk.SelectionMode.NONE)
+        tracks.add_css_class("music-list")
+        tracks.connect("row-activated", self._on_track_activated)
+        self.track_empty = _label("Войдите, чтобы найти музыку или открыть свою медиатеку.", "empty-state", xalign=0.5)
+        self.track_empty.set_wrap(True)
+        tracks.set_placeholder(self.track_empty)
+        return tracks
+
+    def _new_playlists_list(self) -> Gtk.ListBox:
+        playlists = Gtk.ListBox()
+        playlists.set_selection_mode(Gtk.SelectionMode.NONE)
+        playlists.add_css_class("music-list")
+        playlists.connect("row-activated", self._on_playlist_activated)
+        playlists.set_placeholder(_label("Здесь пока нет плейлистов.", "empty-state", xalign=0.5))
+        return playlists
 
     def _build_statusbar(self) -> Gtk.Box:
         status_bar = _box(Gtk.Orientation.HORIZONTAL, 6, "statusbar")
@@ -655,16 +766,22 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_search(self, entry: Gtk.SearchEntry) -> None:
         query = entry.get_text().strip()
         if query:
+            self.view_stack.set_visible_child_name("library")
             self._call("search", query)
 
     def _on_track_activated(self, _box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        if self._render_kind != "tracks" or self.stack.get_visible_child_name() != "tracks":
+            return
         occurrence = self._track_rows.get(row)
         if occurrence is not None:
-            self._call("play_track", *occurrence)
+            self._request_track(*occurrence, self._render_generation)
 
     def _on_playlist_activated(self, _box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        if self._render_kind != "playlists" or self.stack.get_visible_child_name() != "playlists":
+            return
         playlist = self._playlist_rows.get(row)
         if playlist is not None:
+            self.view_stack.set_visible_child_name("library")
             self._call("open_playlist", playlist)
 
     def _on_seek(self, _scale: Gtk.Scale, _scroll: Gtk.ScrollType, value: float) -> bool:
@@ -788,69 +905,298 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if name:
             self._close_device_window()
 
-    @staticmethod
-    def _clear_list(listbox: Gtk.ListBox) -> None:
-        while (row := listbox.get_row_at_index(0)) is not None:
-            listbox.remove(row)
+    def _cancel_render(self) -> None:
+        self._render_generation += 1
+        self._render_queue.clear()
+        if self._render_source_id:
+            GLib.source_remove(self._render_source_id)
+            self._render_source_id = 0
+
+    def _retire_list(self, old_list: Gtk.ListBox) -> None:
+        # Keep the detached list alive while destroying its rows in small idle
+        # slices too; unparenting thousands of widgets must not freeze GTK.
+        if old_list.get_row_at_index(0) is not None:
+            self._retired_lists.append(old_list)
+            if not self._dispose_source_id:
+                self._dispose_source_id = GLib.idle_add(self._dispose_rows)
+
+    def _dispose_rows(self) -> bool:
+        if self._destroyed:
+            self._dispose_source_id = 0
+            return GLib.SOURCE_REMOVE
+        deadline = time.monotonic() + 0.004
+        count = 0
+        while self._retired_lists and count < 24 and (count == 0 or time.monotonic() < deadline):
+            old = self._retired_lists[0]
+            row = old.get_row_at_index(0)
+            if row is None:
+                self._retired_lists.popleft()
+            else:
+                old.remove(row)
+                count += 1
+        if not self._retired_lists:
+            self._dispose_source_id = 0
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _replace_tracks_list(self) -> None:
+        old = self.tracks_list
+        self._retire_list(old)
+        self.tracks_list = self._new_tracks_list()
+        self.track_scroll.set_child(self.tracks_list)
+        self._track_rows = {}
+        self._rows_by_track_id = {}
+        self._highlighted_row = None
+        self._selected_track_index = None
+        self._rendered_track_count = 0
+
+    def _replace_playlists_list(self) -> None:
+        old = self.playlists_list
+        self._retire_list(old)
+        self.playlists_list = self._new_playlists_list()
+        self.playlist_scroll.set_child(self.playlists_list)
+        self._playlist_rows = {}
+
+    def _schedule_render(self) -> None:
+        if self._render_queue and not self._render_source_id and not self._destroyed:
+            self._render_source_id = GLib.idle_add(self._render_rows)
+
+    def _render_rows(self) -> bool:
+        if self._destroyed:
+            self._render_source_id = 0
+            return GLib.SOURCE_REMOVE
+        deadline = time.monotonic() + 0.004
+        count = 0
+        while self._render_queue and count < 24 and (count == 0 or time.monotonic() < deadline):
+            index, item = self._render_queue.popleft()
+            if self._render_kind == "tracks":
+                self._append_track_row(index, item)
+            else:
+                self._append_playlist_row(item)
+            count += 1
+        if not self._render_queue:
+            self._render_source_id = 0
+            self._schedule_auto_more()
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def show_loading(self, heading: str) -> None:
+        """Show a new view immediately while the controller fetches its data."""
+        self.view_stack.set_visible_child_name("library")
+        self.set_tracks([], heading)
+        self.track_empty.set_label("Загрузка…")
+        self.set_status("Загрузка…")
+
+    def show_load_error(self, message: str = "Не удалось загрузить данные. Повторите попытку.") -> None:
+        """Replace the loading placeholder without discarding existing rows."""
+        self.track_empty.set_label(message)
+        self.set_status(message)
 
     def set_tracks(self, tracks: list, heading: str) -> None:
+        self._cancel_render()
+        self._replace_tracks_list()
+        self._render_kind = "tracks"
+        self._auto_more_empty_page = False
+        self._auto_more_layout_retries = 0
         self.heading_label.set_label(heading)
         self.stack.set_visible_child_name("tracks")
-        self._track_rows.clear()
-        self._clear_list(self.tracks_list)
         self.track_empty.set_label("Треки не найдены.")
-        for index, track in enumerate(tracks):
-            row = Gtk.ListBoxRow()
-            if index % 2:
-                row.add_css_class("alternate")
-            line = _box(Gtk.Orientation.HORIZONTAL, 8, "track-row")
-            number = _label(f"{index + 1:02}", "track-number", xalign=0.5)
-            number.set_width_chars(4)
-            line.append(number)
-            artists = ", ".join(track.artists) or "Неизвестный исполнитель"
-            title = _label(f"{artists} — {track.title}", "track-title")
-            title.set_hexpand(True)
-            title.set_ellipsize(Pango.EllipsizeMode.END)
-            line.append(title)
-            album = _label(str(track.album or ""), "track-album")
-            album.set_ellipsize(Pango.EllipsizeMode.END)
-            album.set_width_chars(16)
-            album.set_max_width_chars(24)
-            line.append(album)
-            duration = _label(_format_time(track.duration_ms), "track-duration", xalign=1)
-            duration.set_width_chars(5)
-            line.append(duration)
-            play = _icon_button("media-playback-start-symbolic", f"Воспроизвести: {track.title}", "row-play")
-            play.set_valign(Gtk.Align.CENTER)
-            play.connect("clicked", lambda _button, item=track, position=index: self._call("play_track", item, position))
-            line.append(play)
-            row.set_child(line)
-            self._track_rows[row] = (track, index)
-            self.tracks_list.append(row)
+        self.set_pagination(False)
+        self.append_tracks(tracks)
+
+    def append_tracks(self, tracks: list) -> None:
+        """Add a page without blocking the main loop; indices span all pages."""
+        if self._destroyed or self._render_kind != "tracks":
+            return
+        page = tuple(tracks)
+        if not page and self._pagination_loading:
+            self._auto_more_empty_page = True
+        elif page:
+            self._auto_more_empty_page = False
+            self._auto_more_layout_retries = 0
+        start = self._rendered_track_count
+        self._rendered_track_count += len(page)
+        self._render_queue.extend((start + offset, item) for offset, item in enumerate(page))
+        self._schedule_render()
+
+    def _append_track_row(self, index: int, track) -> None:
+        row = Gtk.ListBoxRow()
+        if index % 2:
+            row.add_css_class("alternate")
+        line = _box(Gtk.Orientation.HORIZONTAL, 8, "track-row")
+        number = _label(f"{index + 1:02}", "track-number", xalign=0.5)
+        number.set_width_chars(4)
+        line.append(number)
+        artists = ", ".join(track.artists) or "Неизвестный исполнитель"
+        title = _label(f"{artists} — {track.title}", "track-title")
+        title.set_hexpand(True)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        line.append(title)
+        album = _label(str(track.album or ""), "track-album")
+        album.set_ellipsize(Pango.EllipsizeMode.END)
+        album.set_width_chars(12)
+        album.set_max_width_chars(24)
+        line.append(album)
+        duration = _label(_format_time(track.duration_ms), "track-duration", xalign=1)
+        duration.set_width_chars(5)
+        line.append(duration)
+        play = _icon_button("media-playback-start-symbolic", f"Воспроизвести: {track.title}", "row-play")
+        play.set_valign(Gtk.Align.CENTER)
+        generation = self._render_generation
+        play.connect("clicked", lambda _button, item=track, position=index, current=generation:
+                     self._request_track(item, position, current))
+        line.append(play)
+        row.set_child(line)
+        self._track_rows[row] = (track, index)
+        self._rows_by_track_id.setdefault(str(track.id), []).append(row)
+        self.tracks_list.append(row)
+        if (self._current_track is not None and str(self._current_track.id) == str(track.id)
+                and (self._highlighted_row is None or index == self._selected_track_index)):
+            self._refresh_current_row()
+
+    def _request_track(self, track, index: int, generation: int) -> None:
+        if self._destroyed or generation != self._render_generation:
+            return
+        self._selected_track_index = index
+        self._call("play_track", track, index)
 
     def set_playlists(self, playlists: list) -> None:
+        self._cancel_render()
+        self._replace_playlists_list()
+        self._render_kind = "playlists"
         self.heading_label.set_label("Плейлисты")
         self.stack.set_visible_child_name("playlists")
-        self._playlist_rows.clear()
-        self._clear_list(self.playlists_list)
-        for playlist in playlists:
-            row = Gtk.ListBoxRow()
-            line = _box(Gtk.Orientation.HORIZONTAL, 8, "track-row")
-            badge = _label("♫", "playlist-badge", xalign=0.5)
-            line.append(badge)
-            title = _label(str(playlist.title), "track-title")
-            title.set_ellipsize(Pango.EllipsizeMode.END)
-            title.set_hexpand(True)
-            line.append(title)
-            line.append(_label(f"Треков: {playlist.track_count}", "track-subtitle"))
-            arrow = _label("›", "playlist-arrow", xalign=0.5)
-            line.append(arrow)
-            row.set_child(line)
-            self._playlist_rows[row] = playlist
-            self.playlists_list.append(row)
+        self.set_pagination(False)
+        self._render_queue.extend(enumerate(playlists))
+        self._schedule_render()
 
-    def set_now_playing(self, track) -> None:
+    def _append_playlist_row(self, playlist) -> None:
+        row = Gtk.ListBoxRow()
+        line = _box(Gtk.Orientation.HORIZONTAL, 8, "track-row")
+        badge = _label("♫", "playlist-badge", xalign=0.5)
+        line.append(badge)
+        title = _label(str(playlist.title), "track-title")
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_hexpand(True)
+        line.append(title)
+        line.append(_label(f"Треков: {playlist.track_count}", "track-subtitle"))
+        line.append(_label("›", "playlist-arrow", xalign=0.5))
+        row.set_child(line)
+        self._playlist_rows[row] = playlist
+        self.playlists_list.append(row)
+
+    def set_pagination(self, has_more: bool, loading: bool = False, error: bool = False) -> None:
+        self._pagination_has_more = bool(has_more)
+        self._pagination_loading = bool(loading)
+        self._pagination_error = bool(error)
+        self.more_button.set_visible(self._pagination_has_more or self._pagination_loading)
+        self.more_button.set_sensitive(self._pagination_has_more and not self._pagination_loading)
+        label = "Загрузка…" if self._pagination_loading else ("Повторить загрузку" if self._pagination_error else "Показать ещё")
+        self.more_button.set_label(label)
+        if self._pagination_has_more and not self._pagination_loading and not self._pagination_error:
+            self._schedule_auto_more()
+        elif self._auto_more_source_id:
+            GLib.source_remove(self._auto_more_source_id)
+            self._auto_more_source_id = 0
+
+    def _on_track_scroll(self, _adjustment: Gtk.Adjustment) -> None:
+        self._schedule_auto_more()
+
+    def _schedule_auto_more(self) -> None:
+        if (self._destroyed or self._auto_more_source_id or not self._pagination_has_more
+                or self._pagination_loading or self._pagination_error or self._auto_more_empty_page):
+            return
+        self._auto_more_source_id = GLib.idle_add(self._check_auto_more)
+
+    def _check_auto_more(self) -> bool:
+        self._auto_more_source_id = 0
+        if (self._destroyed or not self._pagination_has_more or self._pagination_loading or self._pagination_error
+                or self._auto_more_empty_page or self._render_queue
+                or self.view_stack.get_visible_child_name() != "library"
+                or self.stack.get_visible_child_name() != "tracks" or not self.track_scroll.get_mapped()):
+            return GLib.SOURCE_REMOVE
+        adjustment = self.track_scroll.get_vadjustment()
+        page_size = adjustment.get_page_size()
+        last_row = self.tracks_list.get_row_at_index(self._rendered_track_count - 1)
+        if page_size <= 0 or (last_row is not None and last_row.get_height() <= 0):
+            # Row insertion and adjustment allocation happen in different GTK
+            # phases. Do not mistake the previous viewport for the new list.
+            if self._auto_more_layout_retries < 20:
+                self._auto_more_layout_retries += 1
+                self._auto_more_source_id = GLib.timeout_add(50, self._check_auto_more)
+            return GLib.SOURCE_REMOVE
+        self._auto_more_layout_retries = 0
+        if page_size > 0 and adjustment.get_upper() - adjustment.get_value() - page_size <= 300:
+            self._request_more(background=True)
+        return GLib.SOURCE_REMOVE
+
+    def _on_more_clicked(self, _button: Gtk.Button) -> None:
+        self._request_more(background=False)
+
+    def _request_more(self, background: bool) -> None:
+        if not self._pagination_has_more or self._pagination_loading:
+            return
+        self.set_pagination(True, loading=True)
+        if background:
+            self._call("load_more", True)
+        else:
+            self._call("load_more")
+
+    def _refresh_current_row(self) -> None:
+        if self._highlighted_row is not None:
+            self._highlighted_row.remove_css_class("current-track")
+            self._highlighted_row = None
+        if self._current_track is None:
+            return
+        candidates = self._rows_by_track_id.get(str(self._current_track.id), ())
+        preferred = None
+        if self._selected_track_index is not None:
+            preferred = next((row for row in candidates
+                              if self._track_rows[row][1] == self._selected_track_index), None)
+        if preferred is None:
+            preferred = next((row for row in candidates if self._track_rows[row][0] is self._current_track), None)
+        if preferred is None and candidates:
+            preferred = candidates[0]
+        if preferred is not None:
+            preferred.add_css_class("current-track")
+            self._highlighted_row = preferred
+
+    def _on_destroy(self, _window) -> None:
+        if self._destroyed:
+            return
+        self._destroyed = True
+        self._cancel_render()
+        if self._dispose_source_id:
+            GLib.source_remove(self._dispose_source_id)
+            self._dispose_source_id = 0
+        if self._auto_more_source_id:
+            GLib.source_remove(self._auto_more_source_id)
+            self._auto_more_source_id = 0
+        if self._spectrum_source_id:
+            GLib.source_remove(self._spectrum_source_id)
+            self._spectrum_source_id = 0
+        self._retired_lists.clear()
+        display = Gdk.Display.get_default()
+        if display is not None and hasattr(self, "_css_provider"):
+            Gtk.StyleContext.remove_provider_for_display(display, self._css_provider)
+
+    def _on_close_request(self, _window) -> bool:
+        self._on_destroy(self)
+        return False
+
+    def destroy(self) -> None:
+        # Gtk.Window.destroy() may retain an unrealized object until finalization;
+        # stop queued work immediately even in that case.
+        self._on_destroy(self)
+        super().destroy()
+
+    def set_now_playing(self, track, index: int | None = None) -> None:
+        self.set_stream_quality(None, None)
         self._current_track = track
+        if index is not None:
+            self._selected_track_index = index
+        elif track is None:
+            self._selected_track_index = None
         self.favorite_button.set_sensitive(track is not None)
         if track is None:
             self.now_title.set_label("Ничего не играет")
@@ -861,6 +1207,22 @@ class PlayerWindow(Gtk.ApplicationWindow):
             artist = ", ".join(track.artists) or "Неизвестный исполнитель"
             self.now_artist.set_label(artist)
             self.visual_track_title.set_label(f"{artist} — {track.title}")
+        self._refresh_current_row()
+
+    def set_stream_quality(self, codec: str | None, bitrate: int | None) -> None:
+        """Display the actual format of the playing stream, never its preference."""
+        if not codec:
+            self.stream_quality_label.set_visible(False)
+            self.stream_quality_label.set_label("")
+            return
+        formats = {"mp3": "MP3", "aac": "AAC", "aac-mp4": "AAC",
+                   "he-aac": "HE-AAC", "he-aac-mp4": "HE-AAC",
+                   "flac": "FLAC", "flac-mp4": "FLAC"}
+        name = formats.get(str(codec).strip().lower(), "Формат неизвестен")
+        if isinstance(bitrate, int) and not isinstance(bitrate, bool) and bitrate > 0:
+            name += f" · {bitrate} кбит/с"
+        self.stream_quality_label.set_label(name)
+        self.stream_quality_label.set_visible(True)
 
     def set_volume(self, fraction: float) -> None:
         value = min(1.0, max(0.0, fraction))

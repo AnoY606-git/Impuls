@@ -32,7 +32,7 @@ class ImpulsApplication(Gtk.Application):
         self.window = PlayerWindow(self, actions)
         self.window.set_icon_name(APP_ID)
         self.player = AudioPlayer(self._audio_ended, self._audio_error, self._audio_state,
-                                  self._audio_spectrum)
+                                  self._audio_spectrum, on_download_complete=self._audio_download_complete)
         self.window.set_spectrum_available(self.player.spectrum_available)
         self.controller = Controller(self.window, self.player, SecretStore(), MusicService,
                                      dispatch=lambda callback: GLib.idle_add(callback))
@@ -55,7 +55,13 @@ class ImpulsApplication(Gtk.Application):
         if self.controller is not None:
             self.controller.audio_ended()
 
+    def _audio_download_complete(self):
+        if self.controller is not None:
+            self.controller.current_download_complete()
+
     def _audio_error(self):
+        if self.controller is not None and self.controller.audio_error():
+            return
         if self.window is not None:
             self.window.show_error('Не удалось воспроизвести аудио. Проверьте подключение и аудиокодеки.')
 
@@ -71,6 +77,7 @@ class ImpulsApplication(Gtk.Application):
         track = self.controller.current_track
         if not duration and track is not None:
             duration = track.duration_ms
+        self.controller.monitor_playback(position, duration)
         playing = self.controller.display_playing
         self.window.set_playback(playing, position, duration)
         if self.mpris is not None:

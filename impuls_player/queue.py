@@ -21,6 +21,12 @@ class PlaybackQueue:
         return self._tracks[self._history[self._position]]
 
     @property
+    def has_next(self):
+        """Whether Next can advance through loaded tracks without repeating."""
+        return (self._position is not None
+                and (self._position + 1 < len(self._history) or bool(self._pending)))
+
+    @property
     def shuffle_enabled(self):
         return self._shuffle
 
@@ -30,6 +36,7 @@ class PlaybackQueue:
 
     def replace(self, tracks, selected, index=None):
         self._tracks = tuple(tracks)
+        self._planned_cycle = None
         if selected is None:
             self.clear()
             return
@@ -47,6 +54,24 @@ class PlaybackQueue:
         self._position = len(self._history) - 1
         self._visited = {index}
         self._rebuild_pending()
+
+    def append_tracks(self, tracks):
+        """Append a library page without changing the current track or history."""
+        if self._position is None:
+            raise ValueError('Cannot append tracks to an inactive queue')
+        items = tuple(tracks)
+        if not items:
+            return
+        self._planned_cycle = None
+        start = len(self._tracks)
+        self._tracks += items
+        indices = range(start, start + len(items))
+        if self._shuffle:
+            pending = [*self._pending, *indices]
+            self._randomizer.shuffle(pending)
+            self._pending = deque(pending)
+        else:
+            self._pending.extend(indices)
 
     def append_wave(self, tracks):
         """Extend an ordered, non-repeating radio queue without losing history."""
@@ -69,13 +94,15 @@ class PlaybackQueue:
     def set_shuffle(self, enabled):
         if not isinstance(enabled, bool) or enabled == self._shuffle:
             return
+        self._planned_cycle = None
         self._shuffle = enabled
         if self._position is not None:
             del self._history[self._position + 1:]
             self._rebuild_pending()
 
     def set_repeat(self, enabled):
-        if isinstance(enabled, bool):
+        if isinstance(enabled, bool) and enabled != self._repeat:
+            self._planned_cycle = None
             self._repeat = enabled
 
     def _rebuild_pending(self):
@@ -90,15 +117,36 @@ class PlaybackQueue:
             candidates = list(range(index + 1, len(self._tracks)))
         self._pending = deque(candidates)
 
-    def _new_cycle(self):
+    def _make_cycle(self):
         candidates = list(range(len(self._tracks)))
-        self._visited.clear()
         if self._shuffle:
             self._randomizer.shuffle(candidates)
             current = self._history[self._position]
             if len(candidates) > 1 and candidates[0] == current:
                 candidates[0], candidates[1] = candidates[1], candidates[0]
+        return candidates
+
+    def _new_cycle(self):
+        candidates = self._planned_cycle if self._planned_cycle is not None else self._make_cycle()
+        self._planned_cycle = None
+        self._visited.clear()
         self._pending = deque(candidates)
+
+    def peek_next(self):
+        """Return the next track without advancing the current item or history."""
+        if self._position is None:
+            return None
+        if self._position + 1 < len(self._history):
+            return self._tracks[self._history[self._position + 1]]
+        if self._pending:
+            return self._tracks[self._pending[0]]
+        if self._repeat and not self._shuffle:
+            return self._tracks[0]
+        if self._repeat and self._shuffle:
+            if self._planned_cycle is None:
+                self._planned_cycle = self._make_cycle()
+            return self._tracks[self._planned_cycle[0]]
+        return None
 
     def next(self):
         if self._position is None:
@@ -137,3 +185,4 @@ class PlaybackQueue:
         self._position = None
         self._visited = set()
         self._pending = deque()
+        self._planned_cycle = None

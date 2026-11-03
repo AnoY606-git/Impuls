@@ -31,6 +31,9 @@ class ApplicationSmokeTests(unittest.TestCase):
             self.assertIn('equalizer_preset', application.window.actions)
             self.assertIn('set_shuffle', application.window.actions)
             self.assertIn('set_repeat', application.window.actions)
+            with patch.object(application.controller, 'current_download_complete') as received:
+                application.player._on_download_complete()
+                received.assert_called_once_with()
             if application.player.spectrum_available:
                 levels = (0.4,) * 32
                 application.player._on_spectrum(levels)

@@ -1,7 +1,7 @@
 %global buildsubdir impuls-%{version}
 
 Name:           impuls
-Version:        1.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Independent retro-styled Yandex Music player
 License:        GPL-3.0-only AND LGPL-3.0-only
@@ -74,5 +74,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:%{buildroot}%{_datadir}/impuls/vendor %{_
 %{_datadir}/metainfo/io.github.AnoY606_git.Impuls.metainfo.xml
 
 %changelog
+* Tue Nov 03 2026 AnoY606-git and contributors - 1.0.1-1
+- Load collections incrementally, cache metadata, improve responsive UI
+- Prefetch upcoming audio in memory, select quality and recover stalled streams
+
 * Tue Nov 03 2026 AnoY606-git and contributors - 1.0-1
 - Initial release
