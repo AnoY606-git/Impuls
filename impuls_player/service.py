@@ -310,6 +310,14 @@ class MusicService:
             return result
         return _safely("Не удалось подготовить воспроизведение.", run)
 
+    def invalidate_cache(self) -> None:
+        """Refresh future views without altering captured playback snapshots."""
+        with self._cache_lock:
+            self._likes_generation += 1
+            self._likes_cache = None
+            self._playlists_cache.clear()
+            self._metadata_cache.clear()
+
     def search(self, query: str) -> list[Track]:
         if not isinstance(query, str) or not query.strip():
             return []

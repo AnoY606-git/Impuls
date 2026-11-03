@@ -8,6 +8,7 @@ from .controller import Controller
 from .player import AudioPlayer
 from .secrets import SecretStore
 from .service import MusicService
+from .settings import Settings
 from .ui import PlayerWindow
 
 
@@ -21,12 +22,16 @@ class ImpulsApplication(Gtk.Application):
         self.controller = None
         self.player = None
         self.mpris = None
+        self.tray = None
+        self.settings = Settings()
+        self._settings_loaded = False
+        self._quitting = False
         self._refresh_id = None
         self._mpris_track = None
 
     def do_activate(self):
         if self.window is not None:
-            self.window.present()
+            self.present_window()
             return
         actions = {}
         self.window = PlayerWindow(self, actions)
@@ -37,15 +42,86 @@ class ImpulsApplication(Gtk.Application):
         self.controller = Controller(self.window, self.player, SecretStore(), MusicService,
                                      dispatch=lambda callback: GLib.idle_add(callback))
         actions.update(self.controller.actions())
+        actions.update(close_window=self.close_window, hide_window=self.hide_window,
+                       quit=self.request_quit)
+        self._restore_settings()
         try:
             from .mpris import Mpris
-            self.mpris = Mpris(self.controller, on_raise=self.window.present, on_quit=self.quit)
+            self.mpris = Mpris(self.controller, on_raise=self.present_window, on_quit=self.request_quit)
         except Exception:
             # A missing session bus must not prevent playback.
             self.mpris = None
-        self.window.present()
+        from .tray import Tray
+        self.tray = Tray(self.controller, self.present_window, self.request_quit, self._tray_available)
+        self.window.set_tray_available(self.tray.available)
+        self.present_window()
         self._refresh_id = GLib.timeout_add(500, self._refresh)
         self.controller.restore()
+
+    def present_window(self):
+        if self.window is not None and not self._quitting:
+            self.window.present()
+
+    def hide_window(self):
+        if (not self._quitting and self.window is not None
+                and self.tray is not None and self.tray.available):
+            self.window.set_visible(False)
+            return True
+        return False
+
+    def close_window(self):
+        """Keep the window alive only when a tray host can restore it."""
+        return self.hide_window()
+
+    def request_quit(self):
+        self._quitting = True
+        self.quit()
+
+    def _tray_available(self, available):
+        if self.window is not None:
+            self.window.set_tray_available(available)
+            if not available and not self.window.get_visible():
+                self.present_window()
+
+    def _restore_settings(self):
+        values = self.settings.load()
+        self.controller.set_volume(values['volume'])
+        self.controller.set_quality(values['quality'])
+        # Keep selector synchronization passive so restoration does not repeat
+        # a controller action or cancel prefetch twice.
+        set_quality = getattr(self.window, 'set_quality', None)
+        if callable(set_quality):
+            set_quality(values['quality'])
+        else:
+            selector = self.window.quality_selector
+            handler = getattr(self.window, '_on_quality_selected', None)
+            if handler is not None:
+                selector.handler_block_by_func(handler)
+            try:
+                selector.set_selected(('nq', 'hq', 'lossless').index(values['quality']))
+            finally:
+                if handler is not None:
+                    selector.handler_unblock_by_func(handler)
+        gains = values['equalizer']
+        if self.player.equalizer_available:
+            for index, gain in enumerate(gains):
+                self.controller.set_equalizer(index, gain)
+        self.window.set_equalizer_values(gains)
+        mode = values.get('visualization', 'ribbons')
+        selector = getattr(self.window, 'visualization_selector', None)
+        if selector is not None:
+            selector.set_selected(('ribbons', 'bars', 'mirror', 'orbit').index(mode))
+        self._settings_loaded = True
+
+    def _save_settings(self):
+        if self.window is None or not self._settings_loaded:
+            return
+        self.settings.save({
+            'volume': self.window.volume_scale.get_value(),
+            'quality': ('nq', 'hq', 'lossless')[self.window.quality_selector.get_selected()],
+            'equalizer': [slider.get_value() for slider in self.window.equalizer_sliders],
+            'visualization': getattr(self.window, '_visualization_mode', 'ribbons'),
+        })
 
     def _audio_spectrum(self, levels):
         if self.window is not None:
@@ -80,6 +156,8 @@ class ImpulsApplication(Gtk.Application):
         self.controller.monitor_playback(position, duration)
         playing = self.controller.display_playing
         self.window.set_playback(playing, position, duration)
+        if self.tray is not None:
+            self.tray.set_playback(track, playing)
         if self.mpris is not None:
             if track != self._mpris_track:
                 self.mpris.set_track(track)
@@ -91,11 +169,15 @@ class ImpulsApplication(Gtk.Application):
         return True
 
     def do_shutdown(self):
+        self._quitting = True
+        self._save_settings()
         if self._refresh_id is not None:
             GLib.source_remove(self._refresh_id)
             self._refresh_id = None
         if self.mpris is not None:
             self.mpris.close()
+        if self.tray is not None:
+            self.tray.close()
         if self.controller is not None:
             self.controller.close()
         if self.player is not None:

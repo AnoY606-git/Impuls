@@ -1,6 +1,7 @@
 """Coordinates the UI, player and service without blocking the UI thread."""
 
 from concurrent.futures import ThreadPoolExecutor
+import random
 from threading import Event, RLock
 from time import monotonic
 
@@ -75,6 +76,7 @@ class Controller:
         self._visible_wave = False
         self._session = 0
         self._view = 0
+        self._view_request = None
         self._wave_request = 0
         self._play = 0
         self._pending = 0
@@ -95,7 +97,8 @@ class Controller:
             'login', 'device_login', 'logout', 'search', 'wave', 'liked_tracks', 'playlists',
             'open_playlist', 'play_track', 'toggle_playback', 'next_track',
             'previous_track', 'seek', 'set_volume', 'set_equalizer', 'equalizer_preset',
-            'set_shuffle', 'set_repeat', 'set_liked', 'load_more', 'set_quality')}
+            'set_shuffle', 'set_repeat', 'set_liked', 'load_more', 'set_quality',
+            'refresh_view', 'play_all')}
 
     def _submit(self, task, success, error_message, valid=lambda: True, *, api=False, storage=False, essential=False, stream=False, failure=None):
         if self._closed:
@@ -143,6 +146,7 @@ class Controller:
             self._session += 1
             current = self._session
         self._view += 1
+        self._view_request = None
         self._play += 1
         self._service = None
         self._visible_tracks = []
@@ -255,7 +259,7 @@ class Controller:
                      'Не удалось удалить токен из системного хранилища секретов.',
                      storage=True, essential=True)
 
-    def _load(self, operation, heading, playlists=False):
+    def _load(self, operation, heading, playlists=False, refresh=False):
         service = self._service
         if service is None:
             self.window.set_status('Войдите, чтобы открыть коллекцию.')
@@ -263,12 +267,16 @@ class Controller:
         self._view += 1
         self._page_loader = None
         self._page_loading = False
+        self._visible_tracks = []
+        self._visible_wave = False
         self.window.set_pagination(False)
         view, session = self._view, self._session
         self.window.show_loading(heading)
         self.window.set_status('Загрузка…')
         def work():
             with self._api_lock:
+                if refresh:
+                    service.invalidate_cache()
                 return operation(service, lambda: view != self._view
                                  or session != self._session or self._closed)
         def done(result):
@@ -286,11 +294,17 @@ class Controller:
                      lambda: view == self._view and session == self._session, api=True, failure=failed)
         self._resume_queue_after_navigation()
 
-    def _load_page(self, loader, heading):
+    def _load_page(self, loader, heading, refresh=False):
         if self._service is None:
             self.window.set_status('Войдите, чтобы открыть коллекцию.')
             return
         self._view += 1
+        if refresh:
+            original_loader = loader
+            def loader(service, offset, cancel):
+                if offset == 0:
+                    service.invalidate_cache()
+                return original_loader(service, offset, cancel)
         self._page_loader = loader
         self._page_heading = heading
         self._page_offset = 0
@@ -412,10 +426,41 @@ class Controller:
                 self.window.show_error('Не удалось продолжить очередь. Попробуйте ещё раз.')
         self._submit(work, done, None, valid, api=True, failure=failed)
 
-    def search(self, query):
+    def search(self, query, *, refresh=False):
         query = query.strip()
         if query:
-            self._load(lambda service, cancel: service.search(query), 'Результаты поиска')
+            self._view_request = ('search', query)
+            self._load(lambda service, cancel: service.search(query), 'Результаты поиска', refresh=refresh)
+
+    def refresh_view(self):
+        """Reload the viewed collection while retaining the sounding queue."""
+        if self._service is None:
+            self.window.set_status('Войдите, чтобы обновить коллекцию.')
+            return
+        request = self._view_request
+        if request is None:
+            self.window.set_status('Откройте поиск, любимые треки или плейлист для обновления.')
+            return
+        kind, *args = request
+        operation = {'search': self.search, 'liked_tracks': self.liked_tracks,
+                     'playlists': self.playlists, 'open_playlist': self.open_playlist}[kind]
+        operation(*args, refresh=True)
+
+    def play_all(self, shuffle=False):
+        """Start the visible list, keeping duplicate occurrences distinct."""
+        if self._service is None:
+            self.window.set_status('Войдите, чтобы слушать музыку.')
+            return
+        if not isinstance(shuffle, bool):
+            return
+        if not self._visible_tracks:
+            self.window.set_status('В текущем списке нет треков для воспроизведения.')
+            return
+        is_wave = self._wave is not None and self._visible_wave
+        if not is_wave:
+            self.set_shuffle(shuffle)
+        index = random.randrange(len(self._visible_tracks)) if shuffle and not is_wave else 0
+        self.play_track(self._visible_tracks[index], index=index)
 
     def wave(self):
         service = self._service
@@ -423,6 +468,7 @@ class Controller:
             self.window.set_status('Войдите, чтобы включить Мою волну.')
             return
         self._view += 1
+        self._view_request = None
         self._page_loader = None
         self._page_loading = False
         self.window.set_pagination(False)
@@ -501,16 +547,19 @@ class Controller:
         self._wave_seconds = 0.0
         self._wave_since = None
 
-    def liked_tracks(self):
+    def liked_tracks(self, *, refresh=False):
+        self._view_request = ('liked_tracks',)
         snapshot = CollectionSnapshot()
-        self._load_page(lambda service, offset, cancel: service.liked_tracks_page(offset=offset, limit=100, should_cancel=cancel, snapshot=snapshot), 'Мне нравится')
+        self._load_page(lambda service, offset, cancel: service.liked_tracks_page(offset=offset, limit=100, should_cancel=cancel, snapshot=snapshot), 'Мне нравится', refresh=refresh)
 
-    def playlists(self):
-        self._load(lambda service, cancel: service.playlists(), 'Плейлисты', playlists=True)
+    def playlists(self, *, refresh=False):
+        self._view_request = ('playlists',)
+        self._load(lambda service, cancel: service.playlists(), 'Плейлисты', playlists=True, refresh=refresh)
 
-    def open_playlist(self, playlist):
+    def open_playlist(self, playlist, *, refresh=False):
+        self._view_request = ('open_playlist', playlist)
         snapshot = CollectionSnapshot()
-        self._load_page(lambda service, offset, cancel: service.playlist_tracks_page(playlist, offset=offset, limit=100, should_cancel=cancel, snapshot=snapshot), playlist.title)
+        self._load_page(lambda service, offset, cancel: service.playlist_tracks_page(playlist, offset=offset, limit=100, should_cancel=cancel, snapshot=snapshot), playlist.title, refresh=refresh)
 
     def play_track(self, track, index=None):
         if self._service is None:
@@ -772,9 +821,11 @@ class Controller:
         if self.playback_pending:
             self._desired_playing = playing
         elif self.player.has_source:
+            # GStreamer can synchronously report a state-change failure from
+            # toggle(); recovery must observe the user's latest intent.
+            self._desired_playing = playing
             if self.player.playing != playing:
                 self.player.toggle()
-            self._desired_playing = playing
         elif playing and self._queue.current is not None:
             self.restart_current()
 

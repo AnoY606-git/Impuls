@@ -359,7 +359,11 @@ class AudioPlayer:
             return
         self._playing = not self._playing
         if self._resume_phase is None:
-            self._player.set_state(self._gst.State.PLAYING if self._playing else self._gst.State.PAUSED)
+            state = self._gst.State.PLAYING if self._playing else self._gst.State.PAUSED
+            if self._player.set_state(state) == self._gst.StateChangeReturn.FAILURE:
+                self.stop()
+                self._on_error()
+                return
         if not self._playing:
             self._clear_spectrum()
 

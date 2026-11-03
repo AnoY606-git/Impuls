@@ -17,6 +17,15 @@ class FormatterTests(unittest.TestCase):
         self.assertEqual(_format_time(3600000), '60:00')
 
 class SecurityTests(unittest.TestCase):
+    def test_track_links_cannot_escape_service_origin(self):
+        import impuls_player.ui as ui
+        builder = getattr(ui, '_track_url', None)
+        self.assertTrue(callable(builder), 'Track link builder must exist')
+        self.assertEqual(builder('123'), 'https://music.yandex.ru/track/123')
+        self.assertEqual(builder('123:456'), 'https://music.yandex.ru/track/123')
+        for track_id in ('', '../123', '//evil.test', '1?next=https://evil.test', None):
+            self.assertIsNone(builder(track_id))
+
     def test_device_login_only_links_to_yandex_over_https(self):
         self.assertIsNotNone(_is_safe_login_url, 'Login URL validator must exist')
         self.assertTrue(_is_safe_login_url('https://ya.ru/device'))

@@ -30,8 +30,8 @@ class SourceArchiveTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             with tarfile.open(archive, 'r:gz') as source:
                 names = set(source.getnames())
-            self.assertIn('impuls-1.0.1/impuls_player/app.py', names)
-            self.assertIn('impuls-1.0.1/packaging/impuls.spec', names)
+            self.assertIn('impuls-1.1.0/impuls_player/app.py', names)
+            self.assertIn('impuls-1.1.0/packaging/impuls.spec', names)
             self.assertFalse(any(name.endswith(('/.env', '/experimental.py', '/test_untracked.py'))
                                  for name in names))
 

@@ -120,6 +120,18 @@ class ResumePlaybackTests(unittest.TestCase):
         self.assertFalse(player.playing)
         self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.NULL,))
 
+    def test_failed_pause_or_resume_stops_source_and_reports_error(self):
+        for initially_playing in (True, False):
+            with self.subTest(initially_playing=initially_playing):
+                player, pipeline, _message, errors = self.make_player()
+                player.play_url('https://s50vla.storage.yandex.net/audio', autoplay=initially_playing)
+                pipeline.set_state.return_value = Gst.StateChangeReturn.FAILURE
+                player.toggle()
+                self.assertEqual(errors, [True])
+                self.assertFalse(player.has_source)
+                self.assertFalse(player.playing)
+                self.assertEqual(pipeline.set_state.call_args.args, (Gst.State.NULL,))
+
     def test_user_seek_cancels_the_pending_resume_seek(self):
         player, pipeline, message, _errors = self.make_player()
         pipeline.query_duration.return_value = (True, 5000 * Gst.MSECOND)

@@ -57,7 +57,7 @@ def near_bottom_adjustment(window, allocate=True):
     window.track_scroll = MappedScroll()
     last = window.tracks_list.get_row_at_index(window._rendered_track_count - 1)
     if allocate and last is not None:
-        last.allocate(400, 24, -1, None)
+        last.allocate(400, 56, -1, None)
     return adjustment
 
 
@@ -71,13 +71,139 @@ class PlayerWindowTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(PlayerWindow, 'Player window module must be implemented')
         self.calls = []
-        names = ('login', 'logout', 'search', 'liked_tracks', 'playlists', 'open_playlist', 'play_track', 'toggle_playback', 'next_track', 'previous_track', 'seek', 'set_volume', 'set_liked', 'device_login', 'wave', 'set_equalizer', 'equalizer_preset', 'set_shuffle', 'set_repeat', 'load_more', 'set_quality')
+        names = ('login', 'logout', 'search', 'liked_tracks', 'playlists', 'open_playlist', 'play_track', 'toggle_playback', 'next_track', 'previous_track', 'seek', 'set_volume', 'set_liked', 'device_login', 'wave', 'set_equalizer', 'equalizer_preset', 'set_shuffle', 'set_repeat', 'load_more', 'set_quality', 'refresh_view', 'play_all', 'hide_window', 'quit')
         self.actions = {name: (lambda *args, name=name: self.calls.append((name, args))) for name in names}
         self.window = PlayerWindow(self.app, self.actions)
 
     def tearDown(self):
         if hasattr(self, 'window'):
             self.window.destroy()
+
+    def test_refresh_and_list_playback_use_current_view_actions(self):
+        self.assertTrue(hasattr(self.window, 'refresh_button'), 'Refresh control is missing')
+        self.window.refresh_button.emit('clicked')
+        self.assertFalse(self.window.play_all_button.get_sensitive())
+
+        track = SimpleNamespace(id='1', title='Трек', artists=('Автор',), album='', duration_ms=60000)
+        self.window.set_tracks([track], 'Любимые треки')
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(0) is not None)
+        self.window.play_all_button.emit('clicked')
+        self.window.shuffle_all_button.emit('clicked')
+        self.assertEqual(self.calls, [('refresh_view', ()), ('play_all', (False,)), ('play_all', (True,))])
+        self.window.set_playlists([])
+        self.assertFalse(self.window.play_all_button.get_sensitive())
+
+    def test_window_titlebar_matches_player_and_keeps_window_controls(self):
+        titlebar = self.window.get_titlebar()
+        self.assertIsInstance(titlebar, Gtk.HeaderBar)
+        self.assertTrue(titlebar.has_css_class('window-header'))
+        self.assertTrue(titlebar.get_show_title_buttons())
+        self.assertEqual(titlebar.get_decoration_layout(), ':minimize,maximize,close')
+        self.assertTrue(self.window.get_resizable())
+        self.window.present()
+        drain_until(lambda: titlebar.get_width() > 0)
+        for name in ('minimize', 'maximize', 'close'):
+            control = next(w for w in walk(titlebar) if isinstance(w, Gtk.Button) and w.has_css_class(name))
+            self.assertTrue(control.get_visible())
+            self.assertGreater(control.get_width(), 0)
+            icon = next(w for w in walk(control) if isinstance(w, Gtk.Image))
+            self.assertGreater(icon.get_style_context().get_color().alpha, 0.5)
+
+    def test_muting_restores_last_nonzero_volume(self):
+        self.assertTrue(hasattr(self.window, 'mute_button'), 'Mute control is missing')
+        self.window.volume_scale.set_value(0.4)
+        self.calls.clear()
+        self.window.mute_button.emit('clicked')
+        self.assertEqual(self.window.volume_scale.get_value(), 0.0)
+        self.window.mute_button.emit('clicked')
+        self.assertAlmostEqual(self.window.volume_scale.get_value(), 0.4)
+        self.assertEqual(self.calls, [('set_volume', (0.0,)), ('set_volume', (0.4,))])
+
+    def test_manual_equalizer_choice_survives_resizing(self):
+        self.window.allocate(480, 360, -1, None)
+        self.window.equalizer_toggle.emit('clicked')
+        self.assertTrue(self.window.equalizer_body.get_visible())
+        self.window.allocate(860, 720, -1, None)
+        self.window.allocate(480, 360, -1, None)
+        self.assertTrue(self.window.equalizer_body.get_visible())
+
+    def test_equalizer_starts_collapsed_at_all_window_sizes(self):
+        for width, height in ((480, 360), (600, 600), (960, 800), (1280, 1000)):
+            with self.subTest(size=(width, height)):
+                self.window.allocate(width, height, -1, None)
+                self.assertFalse(self.window.equalizer_body.get_visible())
+
+    def test_compact_track_rows_hide_album_but_keep_title_and_artist(self):
+        track = SimpleNamespace(id='1', title='Название', artists=('Исполнитель',), album='Альбом', duration_ms=60000)
+        self.window.set_tracks([track], 'Поиск')
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(0) is not None)
+        row = self.window.tracks_list.get_row_at_index(0)
+        self.assertTrue(any(isinstance(w, Gtk.Label) and w.get_label() == 'Название' for w in walk(row)))
+        self.assertTrue(any(isinstance(w, Gtk.Label) and w.get_label() == 'Исполнитель' for w in walk(row)))
+        self.window.allocate(480, 360, -1, None)
+        album = next(w for w in walk(row) if isinstance(w, Gtk.Label) and w.get_label() == 'Альбом')
+        self.assertFalse(album.get_visible())
+        self.assertFalse(self.window.column_album.get_visible())
+        self.window.allocate(860, 720, -1, None)
+        self.assertTrue(album.get_visible())
+        self.assertTrue(self.window.column_album.get_visible())
+
+    def test_navigation_marks_current_section(self):
+        self.window.liked_button.emit('clicked')
+        self.assertTrue(self.window.liked_button.has_css_class('active-nav'))
+        self.window.wave_button.emit('clicked')
+        self.assertFalse(self.window.liked_button.has_css_class('active-nav'))
+        self.assertTrue(self.window.wave_button.has_css_class('active-nav'))
+        self.window.search_entry.set_text('Кино')
+        self.window.search_entry.emit('activate')
+        self.assertFalse(self.window.wave_button.has_css_class('active-nav'))
+
+    def test_status_tooltip_preserves_full_message(self):
+        self.window.set_status('Очень длинное сообщение об ошибке запроса')
+        self.assertEqual(self.window.status_label.get_tooltip_text(), 'Очень длинное сообщение об ошибке запроса')
+
+    def test_close_interception_preserves_live_window_sources(self):
+        self.window.actions['close_window'] = lambda: True
+        self.assertTrue(self.window._on_close_request(self.window))
+        self.assertFalse(self.window._destroyed)
+        self.window.actions['close_window'] = lambda: False
+        self.assertFalse(self.window._on_close_request(self.window))
+        self.assertTrue(self.window._destroyed)
+
+    def test_hide_window_is_available_only_with_tray_host(self):
+        self.assertTrue(hasattr(self.window, 'hide_button'), 'Hide menu action is missing')
+        self.assertFalse(self.window.hide_button.get_sensitive())
+        self.window.set_tray_available(True)
+        self.assertTrue(self.window.hide_button.get_sensitive())
+        self.window.set_tray_available(False)
+        self.assertFalse(self.window.hide_button.get_sensitive())
+
+    def test_visualizer_choice_changes_renderer_without_resetting_audio(self):
+        self.assertTrue(hasattr(self.window, 'visualization_selector'), 'Visualization selector is missing')
+        self.window.set_spectrum_available(True)
+        self.window.set_spectrum((0.5,) * 32)
+        self.window.visualization_selector.set_selected(1)
+        self.assertEqual(self.window._visualization_mode, 'bars')
+        self.assertEqual(self.window._spectrum_levels, (0.5,) * 32)
+
+    def test_long_metadata_and_controls_fit_compact_width(self):
+        track = SimpleNamespace(id='1', title='Длинное название ' * 30, artists=('Длинное имя ' * 20,), album='Длинный альбом ' * 20, duration_ms=60000)
+        self.window.set_tracks([track], 'Медиатека ' * 30)
+        self.window.set_account('Длинное имя аккаунта ' * 20)
+        self.window.set_now_playing(track)
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(0) is not None)
+        for width in (480, 600, 860):
+            with self.subTest(width=width):
+                self.window.allocate(width, 360, -1, None)
+                self.assertLessEqual(self.window._root_box.get_width(), width)
+                controls = (self.window.play_button, self.window.volume_scale, self.window.quality_selector,
+                            self.window.search_entry, self.window.account_button, self.window.refresh_button)
+                for control in controls:
+                    success, bounds = control.compute_bounds(self.window._root_box)
+                    self.assertTrue(success)
+                    self.assertGreater(control.get_width(), 0)
+                    self.assertGreaterEqual(bounds.get_x(), 0)
+                    self.assertLessEqual(bounds.get_x() + bounds.get_width(), width)
 
     def test_search_and_library_navigation_emit_actions(self):
         search = self.window.search_entry
@@ -222,7 +348,7 @@ class PlayerWindowTests(unittest.TestCase):
         for _ in range(4):
             GLib.MainContext.default().iteration(False)
         self.assertEqual(self.calls, [])
-        last.allocate(400, 24, -1, None)
+        last.allocate(400, 56, -1, None)
         adjustment.emit('changed')
         drain_until(lambda: bool(self.calls))
         self.assertEqual(self.calls, [('load_more', (True,))])
@@ -259,7 +385,7 @@ class PlayerWindowTests(unittest.TestCase):
                 row = self.window.tracks_list.get_row_at_index(self.window._rendered_track_count - 1)
                 if row is None:
                     return GLib.SOURCE_CONTINUE
-                row.allocate(400, 24, -1, None)
+                row.allocate(400, 56, -1, None)
                 return GLib.SOURCE_REMOVE
             GLib.idle_add(layout_last_row)
         self.window.actions['load_more'] = next_page

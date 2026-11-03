@@ -122,6 +122,173 @@ class ControllerTests(unittest.TestCase):
         self.executor.run()
         self.executor.run()
 
+    def test_refresh_search_reloads_results_without_replacing_playing_queue(self):
+        first, second = self.open_two_track_queue()
+        service = self.controller._service
+        generation = [0]
+        service.invalidate_cache = lambda: generation.__setitem__(0, generation[0] + 1)
+        service.search = lambda query: [Track(f'{query}-{generation[0]}')]
+        self.controller.search('new')
+        self.executor.run()
+        urls = list(self.player.urls)
+        self.controller.refresh_view()
+        self.executor.run()
+        self.assertEqual([track.id for track in self.window.tracks], ['new-1'])
+        self.assertEqual(self.player.urls, urls)
+        self.assertEqual(self.controller.current_track, first)
+        self.controller.next_track()
+        self.executor.run()
+        self.assertEqual(self.controller.current_track, second)
+
+    def test_refresh_likes_keeps_the_playing_snapshot_for_later_pages(self):
+        self.login()
+        service = self.controller._service
+        snapshots, version = {}, [0]
+        def load(offset=0, limit=100, should_cancel=None, snapshot=None):
+            snapshots.setdefault(snapshot, version[0])
+            return [Track(f'{snapshots[snapshot]}-{offset}')], offset == 0
+        service.liked_tracks_page = load
+        service.invalidate_cache = lambda: version.__setitem__(0, version[0] + 1)
+        self.controller.liked_tracks()
+        self.executor.run()
+        self.controller.play_track(self.window.tracks[0])
+        self.executor.run()
+        self.controller.refresh_view()
+        self.executor.run()
+        self.assertEqual([track.id for track in self.window.tracks], ['1-0'])
+        self.assertEqual(self.controller.current_track.id, '0-0')
+        self.controller.next_track()
+        self.executor.run()
+        self.executor.run()
+        self.assertEqual(self.controller.current_track.id, '0-100')
+        self.assertEqual([track.id for track in self.window.tracks], ['1-0'])
+
+    def test_refresh_repeats_playlist_and_playlist_listing_requests(self):
+        self.login()
+        service, version = self.controller._service, [0]
+        service.invalidate_cache = lambda: version.__setitem__(0, version[0] + 1)
+        self.window.set_playlists = lambda items: setattr(self.window, 'playlists', list(items))
+        service.playlists = lambda: [f'list-{version[0]}']
+        self.controller.playlists()
+        self.executor.run()
+        self.controller.refresh_view()
+        self.executor.run()
+        self.assertEqual(self.window.playlists, ['list-1'])
+        playlist = SimpleNamespace(title='Playlist')
+        service.playlist_tracks_page = lambda selected, **kwargs: ([Track(f'playlist-{version[0]}')], False)
+        self.controller.open_playlist(playlist)
+        self.executor.run()
+        self.controller.refresh_view()
+        self.executor.run()
+        self.assertEqual([track.id for track in self.window.tracks], ['playlist-2'])
+
+    def test_refresh_can_retry_failed_search_and_ignores_stale_navigation(self):
+        self.login()
+        self.controller._service.invalidate_cache = lambda: None
+        self.controller._service.search = lambda query: (_ for _ in ()).throw(RuntimeError('offline'))
+        self.controller.search('retry')
+        self.executor.run()
+        self.controller._service.search = lambda query: [Track(query)]
+        self.controller.refresh_view()
+        self.executor.run()
+        self.assertEqual([track.id for track in self.window.tracks], ['retry'])
+        self.controller.refresh_view()
+        self.controller.search('latest')
+        self.executor.run(1)
+        self.executor.run()
+        self.assertEqual([track.id for track in self.window.tracks], ['latest'])
+        self.controller.refresh_view()
+        self.controller.logout()
+        self.executor.run()
+        self.assertEqual(self.window.tracks, [])
+
+    def test_play_all_starts_first_occurrence_and_preserves_duplicate_rows(self):
+        self.login()
+        tracks = [Track('same'), Track('same'), Track('last')]
+        self.controller._visible_tracks = tracks
+        self.controller.set_shuffle(True)
+        self.controller.play_all()
+        self.executor.run()
+        self.assertFalse(self.controller.shuffle_enabled)
+        self.assertEqual(self.controller.current_track, tracks[0])
+        self.controller.next_track()
+        self.executor.run()
+        self.assertEqual(self.controller.current_track.id, 'same')
+        self.controller.next_track()
+        self.executor.run()
+        self.assertEqual(self.controller.current_track.id, 'last')
+
+    def test_play_all_shuffle_starts_random_occurrence_and_plays_entire_list(self):
+        self.login()
+        self.controller._visible_tracks = [Track('first'), Track('middle'), Track('last')]
+        with patch('impuls_player.controller.random.randrange', return_value=1):
+            self.controller.play_all(True)
+        self.executor.run()
+        self.assertTrue(self.controller.shuffle_enabled)
+        self.assertEqual(self.controller.current_track.id, 'middle')
+        heard = [self.controller.current_track.id]
+        for _ in range(2):
+            self.controller.next_track()
+            self.executor.run()
+            heard.append(self.controller.current_track.id)
+        self.assertEqual(set(heard), {'first', 'middle', 'last'})
+
+    def test_play_all_wave_keeps_service_order_and_saved_shuffle_setting(self):
+        self.login()
+        self.controller.set_shuffle(True)
+        self.controller._wave = SimpleNamespace(track_skipped=lambda *_: None)
+        self.controller._visible_wave = True
+        self.controller._visible_tracks = [Track('first'), Track('second')]
+        self.controller.play_all(True)
+        self.executor.run()
+        self.assertEqual(self.controller.current_track.id, 'first')
+        self.assertTrue(self.controller.shuffle_enabled)
+        self.assertFalse(self.controller._queue.shuffle_enabled)
+        self.assertEqual(self.controller._queue.peek_next().id, 'second')
+
+    def test_new_actions_handle_empty_or_signed_out_views(self):
+        actions = self.controller.actions()
+        actions['refresh_view']()
+        actions['play_all']()
+        self.assertEqual(self.executor.jobs, [])
+        self.assertTrue(self.window.status)
+        self.login()
+        self.controller.refresh_view()
+        self.controller.play_all()
+        self.assertEqual(self.executor.jobs, [])
+        self.assertIsNone(self.controller.current_track)
+
+    def test_play_all_during_search_load_does_not_start_previous_visible_list(self):
+        self.open_two_track_queue()
+        urls = list(self.player.urls)
+        self.controller.search('pending')
+        self.controller.play_all()
+        self.executor.run()
+        self.assertEqual(self.player.urls, urls)
+        self.assertEqual(len(self.executor.jobs), 0)
+
+    def test_failed_resume_can_recover_using_the_new_playback_intent(self):
+        self.open_two_track_queue()
+        self.controller.set_playing(False)
+        def failed_toggle():
+            self.player.stop()
+            self.controller.audio_error()
+        self.player.toggle = failed_toggle
+        self.controller.set_playing(True)
+        self.assertTrue(self.controller.playback_pending)
+        self.executor.run()
+        self.assertTrue(self.player.playing)
+
+    def test_failed_pause_does_not_restart_audio_against_user_intent(self):
+        self.open_two_track_queue()
+        def failed_toggle():
+            self.player.stop()
+            self.controller.audio_error()
+        self.player.toggle = failed_toggle
+        self.controller.set_playing(False)
+        self.assertFalse(self.controller.playback_pending)
+        self.assertFalse(self.player.playing)
+
     def test_quality_change_keeps_current_audio_and_rebuilds_next_cache(self):
         self.open_two_track_queue()
         original_urls = list(self.player.urls)

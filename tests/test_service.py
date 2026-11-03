@@ -45,6 +45,32 @@ class MusicServiceTests(unittest.TestCase):
     def test_connect_returns_login(self):
         self.assertEqual(self.service.connect(), "listener")
 
+    def test_invalidate_cache_refreshes_likes_but_keeps_older_view_snapshot(self):
+        self.service.connect()
+        old_view, new_view = CollectionSnapshot(), CollectionSnapshot()
+        self.client.users_likes_tracks.return_value = NS(tracks_ids=['12', '13'])
+        self.client.tracks.side_effect = lambda ids: [api_track(identifier) for identifier in ids]
+        self.assertEqual(self.service.liked_tracks_page(limit=1, snapshot=old_view)[0][0].id, '12:34')
+        self.client.users_likes_tracks.return_value = NS(tracks_ids=['20'])
+        self.service.invalidate_cache()
+        self.assertEqual(self.service.liked_tracks_page(limit=1, snapshot=new_view)[0][0].id, '20:34')
+        self.assertEqual(self.service.liked_tracks_page(offset=1, limit=1, snapshot=old_view)[0][0].id, '13:34')
+
+    def test_invalidate_cache_refreshes_playlist_source_and_track_metadata(self):
+        self.service.connect()
+        playlist = Playlist('1', 'Playlist', '42')
+        old_view, new_view = CollectionSnapshot(), CollectionSnapshot()
+        self.client.users_playlists.return_value = NS(tracks=[NS(track_id='12', track=None), NS(track_id='13', track=None)])
+        self.client.tracks.side_effect = lambda ids: [api_track(identifier, 'Old') for identifier in ids]
+        self.assertEqual(self.service.playlist_tracks_page(playlist, limit=1, snapshot=old_view)[0][0].title, 'Old')
+        self.client.users_playlists.return_value = NS(tracks=[NS(track_id='12', track=None)])
+        self.client.tracks.side_effect = lambda ids: [api_track(identifier, 'Fresh') for identifier in ids]
+        self.service.invalidate_cache()
+        tracks, more = self.service.playlist_tracks_page(playlist, limit=1, snapshot=new_view)
+        self.assertEqual(tracks[0].title, 'Fresh')
+        self.assertFalse(more)
+        self.assertEqual(self.service.playlist_tracks_page(playlist, offset=1, limit=1, snapshot=old_view)[0][0].id, '13:34')
+
     def test_connect_rejects_missing_or_invalid_uid(self):
         for uid in (None, '', '1:2', 'bad', True):
             self.client.me.account.uid = uid

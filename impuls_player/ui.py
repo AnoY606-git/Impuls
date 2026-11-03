@@ -25,6 +25,16 @@ def _format_time(milliseconds: int) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def _track_url(track_id: object) -> str | None:
+    """Build a service link only for numeric track identifiers."""
+    if not isinstance(track_id, str):
+        return None
+    parts = track_id.split(":")
+    if not 1 <= len(parts) <= 2 or any(not part.isascii() or not part.isdigit() for part in parts):
+        return None
+    return f"https://music.yandex.ru/track/{parts[0]}"
+
+
 def _is_safe_login_url(url: str) -> bool:
     """Only offer device sign-in links served over HTTPS by Yandex."""
     if not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url):
@@ -92,6 +102,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._auto_more_layout_retries = 0
         self._destroyed = False
         self._compact_layout = None
+        self._narrow_columns = False
+        self._album_labels = []
+        self._equalizer_user_choice = None
+        self._auto_equalizer_change = False
+        self._last_volume = 0.75
+        self._tray_available = False
+        self._visualization_mode = "ribbons"
+        self._visualization_phase = 0.0
         self._login_window: Gtk.Window | None = None
         self._device_window: Gtk.Window | None = None
         self._error_window: Gtk.Window | None = None
@@ -105,9 +123,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._spectrum_source_id = 0
         self._syncing_equalizer = False
         self._syncing_preset = False
-        self.set_default_size(860, 720)
+        self.set_default_size(960, 800)
         self.set_size_request(480, 360)
         self._install_css()
+        header = Gtk.HeaderBar()
+        header.add_css_class("window-header")
+        header.set_show_title_buttons(True)
+        header.set_decoration_layout(":minimize,maximize,close")
+        header.set_title_widget(_label("Impuls", "window-title", xalign=0.5))
+        self.set_titlebar(header)
         self._build()
         self.connect("destroy", self._on_destroy)
         self.connect("close-request", self._on_close_request)
@@ -121,18 +145,32 @@ class PlayerWindow(Gtk.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self._css_provider = provider
 
-    def _call(self, name: str, *args) -> None:
+    def _call(self, name: str, *args):
         action = self.actions.get(name)
         if action is not None:
-            action(*args)
+            return action(*args)
+        return None
 
     def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
         compact = width < 600 or height < 500
+        narrow = width < 680
+        if self._narrow_columns != narrow and hasattr(self, "column_album"):
+            self._narrow_columns = narrow
+            self.column_album.set_visible(not narrow)
+            for label in self._album_labels:
+                label.set_visible(not narrow)
         if self._compact_layout != compact and hasattr(self, "equalizer_toggle"):
             self._compact_layout = compact
-            self.equalizer_toggle.set_active(not compact)
+            if self._equalizer_user_choice is None:
+                self._auto_equalizer_change = True
+                self.equalizer_toggle.set_active(False)
+                self._auto_equalizer_change = False
             for caption in self._compact_captions:
                 caption.set_visible(not compact)
+            self.account_label.set_visible(not compact)
+            self.deck_controls.set_orientation(Gtk.Orientation.VERTICAL if compact else Gtk.Orientation.HORIZONTAL)
+            self.sound_controls.set_hexpand(not compact)
+            self.sound_controls.set_halign(Gtk.Align.END if not compact else Gtk.Align.FILL)
             if compact:
                 self._root_box.add_css_class("compact-layout")
             else:
@@ -177,7 +215,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _navigate(self, action: str) -> None:
         self.view_stack.set_visible_child_name("library")
+        self._set_active_navigation(action)
         self._call(action)
+
+    def _set_active_navigation(self, action: str) -> None:
+        for name, button in (("wave", self.wave_button), ("liked_tracks", self.liked_button), ("playlists", self.playlists_button)):
+            if action == name:
+                button.add_css_class("active-nav")
+            else:
+                button.remove_css_class("active-nav")
 
     def _build_deck(self) -> Gtk.Box:
         deck = _box(Gtk.Orientation.VERTICAL, 4, "chrome-panel", "deck")
@@ -196,6 +242,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.account_button.add_css_class("title-button")
         self.account_button.connect("clicked", self._on_account_clicked)
         title.append(self.account_button)
+        title.append(self._build_app_menu())
         deck.append(title)
 
         display = _box(Gtk.Orientation.HORIZONTAL, 12, "led-display")
@@ -234,7 +281,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         deck.append(display)
 
         seek_row = _box(Gtk.Orientation.HORIZONTAL, 8, "seek-row")
-        seek_row.append(_label("ПОЗИЦИЯ", "metal-caption"))
+        seek_caption = _label("ПОЗИЦИЯ", "metal-caption")
+        seek_row.append(seek_caption)
+        self._compact_captions += (seek_caption,)
         self.seek_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.001)
         self.seek_scale.set_draw_value(False)
         self.seek_scale.set_hexpand(True)
@@ -245,31 +294,34 @@ class PlayerWindow(Gtk.ApplicationWindow):
         seek_row.append(self.seek_scale)
         deck.append(seek_row)
 
-        controls = _box(Gtk.Orientation.HORIZONTAL, 6, "deck-controls")
+        controls = _box(Gtk.Orientation.HORIZONTAL, 8, "deck-controls")
+        self.deck_controls = controls
+        transport = _box(Gtk.Orientation.HORIZONTAL, 6, "transport-controls")
+        controls.append(transport)
         previous = _icon_button("media-skip-backward-symbolic", "Предыдущий трек", "transport-button")
         previous.connect("clicked", lambda _: self._call("previous_track"))
-        controls.append(previous)
+        transport.append(previous)
         self.play_button = _icon_button("media-playback-start-symbolic", "Воспроизвести", "transport-button", "play-button")
         self.play_button.connect("clicked", lambda _: self._call("toggle_playback"))
-        controls.append(self.play_button)
+        transport.append(self.play_button)
         next_button = _icon_button("media-skip-forward-symbolic", "Следующий трек", "transport-button")
         next_button.connect("clicked", lambda _: self._call("next_track"))
-        controls.append(next_button)
+        transport.append(next_button)
         self.shuffle_button = Gtk.ToggleButton(label="⇄")
         self.shuffle_button.add_css_class("transport-toggle")
         self.shuffle_button.set_tooltip_text("Случайный порядок обычной медиатеки. «Моя волна» сохраняет порядок рекомендаций.")
         self.shuffle_button.update_property([Gtk.AccessibleProperty.LABEL], ["Случайный порядок"])
         self._shuffle_handler = self.shuffle_button.connect("toggled", lambda button: self._call("set_shuffle", button.get_active()))
-        controls.append(self.shuffle_button)
+        transport.append(self.shuffle_button)
         self.repeat_button = Gtk.ToggleButton(label="↻")
         self.repeat_button.add_css_class("transport-toggle")
         self.repeat_button.set_tooltip_text("Повтор обычной очереди. «Моя волна» автоматически загружает следующую партию.")
         self.repeat_button.update_property([Gtk.AccessibleProperty.LABEL], ["Повтор очереди"])
         self._repeat_handler = self.repeat_button.connect("toggled", lambda button: self._call("set_repeat", button.get_active()))
-        controls.append(self.repeat_button)
-        controls.append(Gtk.Box(hexpand=True))
+        transport.append(self.repeat_button)
         self.favorite_button = Gtk.MenuButton(label="♥")
         self.favorite_button.set_tooltip_text("Действия с любимыми треками")
+        self.favorite_button.update_property([Gtk.AccessibleProperty.LABEL], ["Действия с любимыми треками"])
         self.favorite_button.add_css_class("favorite-button")
         self.favorite_button.set_sensitive(False)
         favorite_popover = Gtk.Popover()
@@ -282,18 +334,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         favorite_actions.append(remove_favorite)
         favorite_popover.set_child(favorite_actions)
         self.favorite_button.set_popover(favorite_popover)
-        controls.append(self.favorite_button)
-        volume_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
-        volume_icon.set_tooltip_text("Громкость")
-        controls.append(volume_icon)
+        transport.append(self.favorite_button)
+        sound_controls = _box(Gtk.Orientation.HORIZONTAL, 8, "sound-controls")
+        self.sound_controls = sound_controls
+        sound_controls.set_hexpand(True)
+        sound_controls.set_halign(Gtk.Align.END)
+        controls.append(sound_controls)
+        self.mute_button = _icon_button("audio-volume-high-symbolic", "Выключить звук", "mute-button")
+        self.mute_button.connect("clicked", self._toggle_mute)
+        sound_controls.append(self.mute_button)
         self.volume_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.01)
         self.volume_scale.set_size_request(80, -1)
+        self.volume_scale.set_hexpand(True)
         self.volume_scale.set_draw_value(False)
         self.volume_scale.set_value(0.75)
         self.volume_scale.set_tooltip_text("Громкость")
         self.volume_scale.update_property([Gtk.AccessibleProperty.LABEL], ["Громкость"])
-        self.volume_scale.connect("value-changed", lambda scale: self._call("set_volume", scale.get_value()))
-        controls.append(self.volume_scale)
+        self.volume_scale.connect("value-changed", self._on_volume_changed)
+        sound_controls.append(self.volume_scale)
 
         self.quality_selector = Gtk.DropDown.new_from_strings(["NQ", "HQ", "Lossless"])
         self.quality_selector.add_css_class("quality-selector")
@@ -306,7 +364,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.quality_selector.set_list_factory(factory)
         self.quality_selector.set_selected(1)
         self.quality_selector.connect("notify::selected", self._on_quality_selected)
-        controls.append(self.quality_selector)
+        sound_controls.append(self.quality_selector)
         deck.append(controls)
         return deck
 
@@ -316,6 +374,62 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if selected < len(choices):
             self._call("set_quality", choices[selected])
 
+    def _on_volume_changed(self, scale: Gtk.Scale) -> None:
+        value = scale.get_value()
+        if value > 0:
+            self._last_volume = value
+        icon = "audio-volume-muted-symbolic" if value == 0 else ("audio-volume-low-symbolic" if value < 0.5 else "audio-volume-high-symbolic")
+        self.mute_button.set_icon_name(icon)
+        description = "Включить звук" if value == 0 else "Выключить звук"
+        self.mute_button.set_tooltip_text(description)
+        self.mute_button.update_property([Gtk.AccessibleProperty.LABEL], [description])
+        self._call("set_volume", value)
+
+    def _toggle_mute(self, _button=None) -> None:
+        self.volume_scale.set_value(self._last_volume if self.volume_scale.get_value() == 0 else 0.0)
+
+    def _build_app_menu(self) -> Gtk.MenuButton:
+        menu = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu.add_css_class("app-menu")
+        menu.set_tooltip_text("Меню приложения")
+        menu.update_property([Gtk.AccessibleProperty.LABEL], ["Меню приложения"])
+        popover = Gtk.Popover()
+        body = _box(Gtk.Orientation.VERTICAL, 5, "popover-actions")
+        help_button = Gtk.Button(label="Горячие клавиши · F1")
+        help_button.connect("clicked", lambda _: (popover.popdown(), self._show_shortcuts()))
+        body.append(help_button)
+        self.hide_button = Gtk.Button(label="Свернуть в трей")
+        self.hide_button.set_sensitive(False)
+        self.hide_button.connect("clicked", lambda _: (popover.popdown(), self._call("hide_window")))
+        body.append(self.hide_button)
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        quit_button = Gtk.Button(label="Выйти из Impuls · Ctrl+Q")
+        quit_button.connect("clicked", lambda _: self._call("quit"))
+        body.append(quit_button)
+        popover.set_child(body)
+        menu.set_popover(popover)
+        return menu
+
+    def set_tray_available(self, available: bool) -> None:
+        self._tray_available = bool(available)
+        self.hide_button.set_sensitive(self._tray_available)
+        self.hide_button.set_tooltip_text("Скрыть окно, продолжая воспроизведение" if available else "Системный трей недоступен")
+
+    def _show_shortcuts(self) -> None:
+        window, content = self._modal("Горячие клавиши")
+        content.append(_label("Управляйте музыкой с клавиатуры", "dialog-title"))
+        for keys, description in (("Пробел", "Воспроизведение / пауза"), ("Ctrl + ← / →", "Предыдущий / следующий трек"), ("Ctrl + F", "Поиск музыки"), ("Ctrl + R / F5", "Обновить текущий список"), ("Ctrl + M", "Выключить / включить звук"), ("Ctrl + Q", "Выйти из Impuls"), ("F1", "Эта справка")):
+            line = _box(Gtk.Orientation.HORIZONTAL, 20)
+            key = _label(keys, "shortcut-key")
+            key.set_width_chars(15)
+            line.append(key)
+            line.append(_label(description, "dialog-copy"))
+            content.append(line)
+        close = Gtk.Button(label="Закрыть")
+        close.connect("clicked", lambda _: window.destroy())
+        content.append(close)
+        window.present()
+
     def _build_equalizer(self) -> Gtk.Box:
         equalizer = _box(Gtk.Orientation.VERTICAL, 2, "chrome-panel", "equalizer")
         title = self._panel_title("ЭКВАЛАЙЗЕР")
@@ -324,12 +438,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.equalizer_hint.set_hexpand(True)
         self.equalizer_hint.set_ellipsize(Pango.EllipsizeMode.END)
         title.append(self.equalizer_hint)
-        self.equalizer_toggle = Gtk.ToggleButton(label="−")
+        self.equalizer_toggle = Gtk.ToggleButton(label="+")
         self.equalizer_toggle.add_css_class("title-button")
         self.equalizer_toggle.add_css_class("equalizer-toggle")
-        self.equalizer_toggle.set_active(True)
-        self.equalizer_toggle.set_tooltip_text("Свернуть эквалайзер")
-        self.equalizer_toggle.update_property([Gtk.AccessibleProperty.LABEL], ["Свернуть эквалайзер"])
+        self.equalizer_toggle.set_active(False)
+        self.equalizer_toggle.set_tooltip_text("Развернуть эквалайзер")
+        self.equalizer_toggle.update_property([Gtk.AccessibleProperty.LABEL], ["Развернуть эквалайзер"])
         self.equalizer_toggle.connect("toggled", self._on_equalizer_toggled)
         title.append(self.equalizer_toggle)
         self._preset_names = list(EQUALIZER_PRESETS)
@@ -350,6 +464,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         eq_body = _box(Gtk.Orientation.HORIZONTAL, 6, "equalizer-body")
         self.equalizer_body = eq_body
+        eq_body.set_visible(False)
         gauge = _box(Gtk.Orientation.VERTICAL, 0, "gain-gauge")
         gauge.append(_label("+12", "gain-label", xalign=1))
         upper_gap = Gtk.Box()
@@ -390,6 +505,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_equalizer_toggled(self, toggle: Gtk.ToggleButton) -> None:
         expanded = toggle.get_active()
+        if not self._auto_equalizer_change:
+            self._equalizer_user_choice = expanded
         self.equalizer_body.set_visible(expanded)
         label = "Свернуть эквалайзер" if expanded else "Развернуть эквалайзер"
         toggle.set_label("−" if expanded else "+")
@@ -463,6 +580,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.visual_track_title.set_ellipsize(Pango.EllipsizeMode.END)
         self.visual_track_title.set_max_width_chars(50)
         title.append(self.visual_track_title)
+        from impuls_player.visualizations import VISUALIZATION_MODES
+        self.visual_track_title.set_hexpand(True)
+        self.visualization_selector = Gtk.DropDown.new_from_strings([title for _, title in VISUALIZATION_MODES])
+        self.visualization_selector.add_css_class("preset-selector")
+        self.visualization_selector.set_tooltip_text("Стиль визуализации")
+        self.visualization_selector.update_property([Gtk.AccessibleProperty.LABEL], ["Стиль визуализации"])
+        self.visualization_selector.connect("notify::selected", self._on_visualization_selected)
+        title.append(self.visualization_selector)
         panel.append(title)
         overlay = Gtk.Overlay()
         overlay.add_css_class("visualizer-frame")
@@ -483,6 +608,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         panel.append(overlay)
         self.set_spectrum_available(False)
         return panel
+
+    def _on_visualization_selected(self, selector, _param) -> None:
+        from impuls_player.visualizations import VISUALIZATION_MODES
+        selected = selector.get_selected()
+        if selected < len(VISUALIZATION_MODES):
+            self._visualization_mode = VISUALIZATION_MODES[selected][0]
+            self.visual_area.queue_draw()
 
     def set_spectrum_available(self, available: bool) -> None:
         """Set plugin availability from the GTK/GLib main thread."""
@@ -556,54 +688,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._spectrum_source_id = 0
             return GLib.SOURCE_REMOVE
         if self.visual_area.get_mapped():
+            self._visualization_phase += 0.035
             self.visual_area.queue_draw()
         return GLib.SOURCE_CONTINUE
 
     def _draw_spectrum(self, _area: Gtk.DrawingArea, context: cairo.Context, width: int, height: int) -> None:
-        background = cairo.LinearGradient(0, 0, width, height)
-        background.add_color_stop_rgb(0, 0.018, 0.045, 0.115)
-        background.add_color_stop_rgb(0.55, 0.035, 0.09, 0.19)
-        background.add_color_stop_rgb(1, 0.06, 0.06, 0.16)
-        context.set_source(background)
-        context.paint()
-        levels = self._spectrum_levels
-        if not any(levels) or width <= 1 or height <= 1:
-            return
-        palettes = []
-        for reverse in (False, True):
-            gradient = cairo.LinearGradient(width if reverse else 0, 0, 0 if reverse else width, height)
-            gradient.add_color_stop_rgba(0.0, 0.05, 0.53, 1.0, 0.32)
-            gradient.add_color_stop_rgba(0.32, 0.08, 0.94, 0.91, 0.72)
-            gradient.add_color_stop_rgba(0.62, 0.40, 1.0, 0.53, 0.80)
-            gradient.add_color_stop_rgba(1.0, 0.72, 0.31, 1.0, 0.38)
-            palettes.append(gradient)
-        for family in range(2):
-            direction = -1 if family else 1
-            for layer in range(9):
-                # Geometry changes with measured bands only, never with a synthetic clock.
-                for point in range(97):
-                    x = point / 96
-                    band = x * 31
-                    low = min(30, int(band))
-                    mix = band - low
-                    magnitude = levels[low] * (1 - mix) + levels[low + 1] * mix
-                    envelope = math.sin(math.pi * x) ** 0.55
-                    wave = math.sin(x * math.tau * 1.25 + layer * 0.42 + family * 0.7)
-                    crossing = direction * (x - 0.5) * 0.9
-                    spread = (layer - 4) * 0.035
-                    y = 0.5 + (crossing + wave * 0.31 + spread) * magnitude * envelope
-                    if point == 0:
-                        context.move_to(0, height * y)
-                    else:
-                        context.line_to(width * x, height * y)
-                path = context.copy_path()
-                context.set_line_width(6)
-                context.set_source_rgba(0.12, 0.72 if family else 0.47, 0.92, 0.055)
-                context.stroke()
-                context.append_path(path)
-                context.set_line_width(1.4)
-                context.set_source(palettes[family])
-                context.stroke()
+        from impuls_player.visualizations import draw_visualization
+        draw_visualization(context, width, height, self._spectrum_levels,
+                           mode=self._visualization_mode, phase=self._visualization_phase)
 
     def _build_library(self) -> Gtk.Box:
         library = _box(Gtk.Orientation.VERTICAL, 3, "chrome-panel", "library-panel")
@@ -613,6 +705,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.heading_label.set_hexpand(True)
         self.heading_label.set_ellipsize(Pango.EllipsizeMode.END)
         title.append(self.heading_label)
+        self.refresh_button = _icon_button("view-refresh-symbolic", "Обновить список · Ctrl+R", "refresh-button")
+        self.refresh_button.connect("clicked", lambda _: self._call("refresh_view"))
+        title.append(self.refresh_button)
         library.append(title)
         toolbar = Gtk.FlowBox()
         toolbar.add_css_class("library-toolbar")
@@ -635,6 +730,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
         toolbar.append(self.search_entry)
         library.append(toolbar)
 
+        list_actions = _box(Gtk.Orientation.HORIZONTAL, 6, "list-actions")
+        self.play_all_button = Gtk.Button(label="▶  Слушать всё")
+        self.play_all_button.add_css_class("nav-button")
+        self.play_all_button.set_sensitive(False)
+        self.play_all_button.set_tooltip_text("Воспроизвести текущий список с начала")
+        self.play_all_button.connect("clicked", lambda _: self._call("play_all", False))
+        list_actions.append(self.play_all_button)
+        self.shuffle_all_button = Gtk.Button(label="⇄  Перемешать")
+        self.shuffle_all_button.add_css_class("nav-button")
+        self.shuffle_all_button.set_sensitive(False)
+        self.shuffle_all_button.set_tooltip_text("Воспроизвести текущий список в случайном порядке")
+        self.shuffle_all_button.connect("clicked", lambda _: self._call("play_all", True))
+        list_actions.append(self.shuffle_all_button)
+        library.append(list_actions)
+
         self.stack = Gtk.Stack()
         self.stack.set_vexpand(True)
         self.stack.set_hexpand(True)
@@ -650,6 +760,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         column_title.set_hexpand(True)
         column_header.append(column_title)
         column_album = _label("АЛЬБОМ", "column-label")
+        self.column_album = column_album
         column_album.set_width_chars(16)
         column_album.set_max_width_chars(24)
         column_header.append(column_album)
@@ -657,7 +768,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         column_time.set_width_chars(5)
         column_header.append(column_time)
         column_end = _label("", "column-label")
-        column_end.set_size_request(26, -1)
+        column_end.set_size_request(70, -1)
         column_header.append(column_end)
         track_page.append(column_header)
         self.track_scroll = Gtk.ScrolledWindow()
@@ -750,8 +861,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self.view_stack.set_visible_child_name("library")
             self.search_entry.grab_focus()
             return True
+        if not extra and keyval == Gdk.KEY_F1:
+            self._show_shortcuts()
+            return True
+        if not extra and (keyval == Gdk.KEY_F5 or control and keyval in (Gdk.KEY_r, Gdk.KEY_R)):
+            self._call("refresh_view")
+            return True
+        if control and not extra and keyval in (Gdk.KEY_q, Gdk.KEY_Q):
+            self._call("quit")
+            return True
         if self._focus_is_editable():
             return False
+        if control and not extra and keyval in (Gdk.KEY_m, Gdk.KEY_M):
+            self._toggle_mute()
+            return True
         if control and not extra and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
             self._call("previous_track" if keyval == Gdk.KEY_Left else "next_track")
             return True
@@ -767,6 +890,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         query = entry.get_text().strip()
         if query:
             self.view_stack.set_visible_child_name("library")
+            self._set_active_navigation("search")
             self._call("search", query)
 
     def _on_track_activated(self, _box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
@@ -890,6 +1014,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def set_status(self, message: str) -> None:
         self.status_label.set_label(str(message))
+        self.status_label.set_tooltip_text(str(message))
 
     def set_busy(self, busy: bool) -> None:
         self.spinner.set_visible(bool(busy))
@@ -946,6 +1071,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.track_scroll.set_child(self.tracks_list)
         self._track_rows = {}
         self._rows_by_track_id = {}
+        self._album_labels = []
         self._highlighted_row = None
         self._selected_track_index = None
         self._rendered_track_count = 0
@@ -1016,6 +1142,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._auto_more_layout_retries = 0
         start = self._rendered_track_count
         self._rendered_track_count += len(page)
+        self.play_all_button.set_sensitive(self._rendered_track_count > 0)
+        self.shuffle_all_button.set_sensitive(self._rendered_track_count > 0)
         self._render_queue.extend((start + offset, item) for offset, item in enumerate(page))
         self._schedule_render()
 
@@ -1028,14 +1156,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         number.set_width_chars(4)
         line.append(number)
         artists = ", ".join(track.artists) or "Неизвестный исполнитель"
-        title = _label(f"{artists} — {track.title}", "track-title")
-        title.set_hexpand(True)
+        details = _box(Gtk.Orientation.VERTICAL, 2, "track-details")
+        details.set_hexpand(True)
+        title = _label(str(track.title), "track-title")
         title.set_ellipsize(Pango.EllipsizeMode.END)
-        line.append(title)
+        title.set_tooltip_text(str(track.title))
+        details.append(title)
+        artist = _label(artists, "track-subtitle")
+        artist.set_ellipsize(Pango.EllipsizeMode.END)
+        artist.set_tooltip_text(artists)
+        details.append(artist)
+        line.append(details)
         album = _label(str(track.album or ""), "track-album")
         album.set_ellipsize(Pango.EllipsizeMode.END)
-        album.set_width_chars(12)
+        album.set_width_chars(16)
         album.set_max_width_chars(24)
+        album.set_tooltip_text(str(track.album or ""))
+        album.set_visible(not self._narrow_columns)
+        self._album_labels.append(album)
         line.append(album)
         duration = _label(_format_time(track.duration_ms), "track-duration", xalign=1)
         duration.set_width_chars(5)
@@ -1046,6 +1184,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         play.connect("clicked", lambda _button, item=track, position=index, current=generation:
                      self._request_track(item, position, current))
         line.append(play)
+        line.append(self._track_menu(track, artists))
         row.set_child(line)
         self._track_rows[row] = (track, index)
         self._rows_by_track_id.setdefault(str(track.id), []).append(row)
@@ -1060,10 +1199,39 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._selected_track_index = index
         self._call("play_track", track, index)
 
+    def _track_menu(self, track, artists: str) -> Gtk.MenuButton:
+        menu = Gtk.MenuButton(icon_name="view-more-symbolic")
+        menu.add_css_class("track-menu")
+        menu.set_tooltip_text(f"Действия с треком: {track.title}")
+        menu.update_property([Gtk.AccessibleProperty.LABEL], [f"Действия с треком: {track.title}"])
+        popover = Gtk.Popover()
+        body = _box(Gtk.Orientation.VERTICAL, 5, "popover-actions")
+        copy = Gtk.Button(label="Копировать название и исполнителя")
+        def copy_clicked(_button) -> None:
+            self.get_clipboard().set(f"{artists} — {track.title}")
+            self.set_status("Название и исполнитель скопированы")
+            popover.popdown()
+        copy.connect("clicked", copy_clicked)
+        body.append(copy)
+        url = _track_url(str(track.id))
+        open_link = Gtk.Button(label="Открыть в Яндекс Музыке")
+        open_link.set_sensitive(url is not None)
+        def open_clicked(_button) -> None:
+            popover.popdown()
+            if url is not None:
+                Gtk.show_uri(self, url, Gdk.CURRENT_TIME)
+        open_link.connect("clicked", open_clicked)
+        body.append(open_link)
+        popover.set_child(body)
+        menu.set_popover(popover)
+        return menu
+
     def set_playlists(self, playlists: list) -> None:
         self._cancel_render()
         self._replace_playlists_list()
         self._render_kind = "playlists"
+        self.play_all_button.set_sensitive(False)
+        self.shuffle_all_button.set_sensitive(False)
         self.heading_label.set_label("Плейлисты")
         self.stack.set_visible_child_name("playlists")
         self.set_pagination(False)
@@ -1181,6 +1349,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
             Gtk.StyleContext.remove_provider_for_display(display, self._css_provider)
 
     def _on_close_request(self, _window) -> bool:
+        if self._call("close_window") is True:
+            return True
         self._on_destroy(self)
         return False
 
