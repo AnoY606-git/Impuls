@@ -15,7 +15,7 @@ jobs:
           rpm-build redhat-rpm-config desktop-file-utils appstream curl tar gzip
           dbus-daemon xorg-x11-server-Xvfb xorg-x11-xauth
       - name: Run tests with a virtual display and session bus
-        run: GTK_A11Y=none GDK_BACKEND=x11 IMPULS_TEST_DBUS=1 dbus-run-session -- xvfb-run -a python3 -m unittest discover -s tests -v
+        run: GTK_A11Y=none GDK_BACKEND=x11 IMPULS_TEST_DBUS=1 dbus-run-session -- xvfb-run -a -s '-screen 0 1280x1024x24' python3 -m unittest discover -s tests -v
       - name: Validate desktop metadata
         run: |
           desktop-file-validate data/*.desktop

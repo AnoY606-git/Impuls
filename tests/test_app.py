@@ -128,6 +128,7 @@ class ApplicationSmokeTests(unittest.TestCase):
         # credentials; closing a real window exercises shutdown ordering.
         script = textwrap.dedent("""
             import sys
+            import traceback
             from unittest.mock import patch
             from gi.repository import Gio, GLib
             from impuls_player.app import ImpulsApplication
@@ -158,7 +159,7 @@ class ApplicationSmokeTests(unittest.TestCase):
                         assert app.window.get_visible()
                         app.window.close()
                     except Exception as exc:
-                        errors.append(repr(exc))
+                        errors.append(traceback.format_exc())
                         app.request_quit()
                     return False
                 def activated(_):
@@ -173,7 +174,7 @@ class ApplicationSmokeTests(unittest.TestCase):
                                 assert app.controller.shuffle_enabled
                                 assert app.controller.repeat_enabled
                                 assert win.equalizer_toggle.get_active()
-                                assert tuple(win.get_default_size()) == (1000, 720)
+                                assert tuple(win.get_default_size()) == (1000, 720), tuple(win.get_default_size())
                                 assert win.time_toggle.get_active()
                                 assert not win.mini_button.get_active()
                                 app.request_quit()
@@ -203,7 +204,7 @@ class ApplicationSmokeTests(unittest.TestCase):
                                     # Preferences must be durable before GTK shutdown.
                                     check_saved(app)
                         except Exception as exc:
-                            errors.append(repr(exc))
+                            errors.append(traceback.format_exc())
                             app.request_quit()
                         return False
                     GLib.timeout_add(150, exercise)

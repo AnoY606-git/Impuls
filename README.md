@@ -133,8 +133,10 @@ python3 -m unittest discover -s tests -v
 python3 -m venv --system-site-packages .venv
 .venv/bin/python -m pip install 'yandex-music==3.2.2'
 GTK_A11Y=none GDK_BACKEND=x11 IMPULS_TEST_DBUS=1 \
-  dbus-run-session -- xvfb-run -a .venv/bin/python -m unittest discover -s tests -v
+  dbus-run-session -- xvfb-run -a -s '-screen 0 1280x1024x24' .venv/bin/python -m unittest discover -s tests -v
 ```
+
+Явный размер виртуального экрана нужен для проверок восстановления окна: стандартный Xvfb в Fedora может запускаться с экраном 640×480. Два теста разворачивания окна требуют оконного менеджера X11 и пропускаются в чистом Xvfb; они дополнительно проверены на рабочем столе.
 
 ## Похожие проекты
 

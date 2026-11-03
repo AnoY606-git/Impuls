@@ -353,7 +353,9 @@ class PlayerWindowTests(unittest.TestCase):
                     and self.window.track_scroll.get_height() > 0)
         self.window.jump_to_current()
         adjustment = self.window.track_scroll.get_vadjustment()
-        drain_until(lambda: adjustment.get_value() > 0)
+        # Jump confirms its target on a later frame; a positive adjustment can
+        # precede that confirmation and the final layout allocation.
+        drain_until(lambda: adjustment.get_value() > 0 and self.window._jump_tick_id == 0)
         row = self.window.tracks_list.get_row_at_index(40)
         self.assertIs(self.window.get_focus(), row)
         allocated, bounds = row.compute_bounds(self.window.tracks_list)
