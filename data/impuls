@@ -1,0 +1,9 @@
+#!/usr/bin/python3
+"""Start the system RPM installation of Impuls."""
+import sys
+
+sys.path.insert(0, '/usr/share/impuls/vendor')
+sys.path.insert(0, '/usr/share/impuls')
+from impuls_player.app import main
+
+raise SystemExit(main())

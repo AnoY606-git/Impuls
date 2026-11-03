@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="chrome" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#f7f9fc"/><stop offset=".35" stop-color="#9caabd"/><stop offset=".68" stop-color="#d9e1eb"/><stop offset="1" stop-color="#6b7c93"/></linearGradient>
+    <linearGradient id="lcd" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#194f9e"/><stop offset="1" stop-color="#081b45"/></linearGradient>
+  </defs>
+  <rect x="5" y="5" width="118" height="118" rx="25" fill="url(#chrome)" stroke="#384a61" stroke-width="3"/>
+  <rect x="15" y="17" width="98" height="68" rx="11" fill="url(#lcd)" stroke="#edf6ff" stroke-width="2"/>
+  <path d="M25 53h17l7-15 10 30 9-22 5 7h29" fill="none" stroke="#b6eaff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="31" cy="102" r="8" fill="#e8f0f5" stroke="#47596c" stroke-width="2"/>
+  <circle cx="53" cy="102" r="8" fill="#e8f0f5" stroke="#47596c" stroke-width="2"/>
+  <circle cx="75" cy="102" r="8" fill="#e8f0f5" stroke="#47596c" stroke-width="2"/>
+  <circle cx="98" cy="102" r="5" fill="#ffbb37" stroke="#7b4a12" stroke-width="1"/>
+</svg>

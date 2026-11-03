@@ -1,0 +1,57 @@
+name: Fedora checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install build and test dependencies
+        run: >-
+          dnf install -y python3 python3-gobject python3-cairo python3-requests python3-pysocks python3-typing-extensions
+          gtk4 gobject-introspection gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free libsecret
+          rpm-build redhat-rpm-config desktop-file-utils appstream curl tar gzip
+          dbus-daemon xorg-x11-server-Xvfb xorg-x11-xauth
+      - name: Run tests with a virtual display and session bus
+        run: GTK_A11Y=none GDK_BACKEND=x11 IMPULS_TEST_DBUS=1 dbus-run-session -- xvfb-run -a python3 -m unittest discover -s tests -v
+      - name: Validate desktop metadata
+        run: |
+          desktop-file-validate data/*.desktop
+          appstreamcli validate --no-net data/*.metainfo.xml
+      - name: Build RPM
+        run: scripts/build-rpm.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: impuls-fedora-rpm
+          path: |
+            dist/impuls-1.0-1.fc45.noarch.rpm
+            dist/impuls-1.0-1.fc45.src.rpm
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  clean-install:
+    runs-on: ubuntu-latest
+    needs: build
+    container: fedora:45
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: impuls-fedora-rpm
+          path: dist
+      - name: Install only required dependencies
+        run: dnf install -y --setopt=install_weak_deps=False ./dist/impuls-1.0-1.fc45.noarch.rpm
+      - name: Check installed imports and audio plugins
+        run: |
+          PYTHONPATH=/usr/share/impuls:/usr/share/impuls/vendor python3 - <<'PYTEST'
+          from impuls_player.app import ImpulsApplication
+          import yandex_music
+          import gi
+          gi.require_version('Gst', '1.0')
+          from gi.repository import Gst
+          Gst.init(None)
+          for plugin in ('playbin', 'equalizer-10bands', 'spectrum', 'faad', 'mpg123audiodec', 'souphttpsrc'):
+              assert Gst.ElementFactory.find(plugin) is not None, plugin
+          print('Installed Impuls, yandex-music and audio plugins load successfully')
+          PYTEST

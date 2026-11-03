@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Impuls
+GenericName=Music Player
+GenericName[ru]=Музыкальный плеер
+Comment=Independent Yandex Music desktop player
+Comment[ru]=Независимый клиент Яндекс Музыки
+Exec=impuls
+Icon=io.github.AnoY606_git.Impuls
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true

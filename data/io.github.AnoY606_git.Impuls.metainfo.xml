@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.AnoY606_git.Impuls</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>Impuls</name>
+  <summary>Independent retro-styled Yandex Music player</summary>
+  <summary xml:lang="ru">Независимый ретро-плеер для Яндекс Музыки</summary>
+  <description><p>Listen to your music library, playlists and personal wave in a retro-styled desktop player.</p></description>
+  <launchable type="desktop-id">io.github.AnoY606_git.Impuls.desktop</launchable>
+  <url type="homepage">https://github.com/AnoY606-git/Impuls</url>
+  <url type="bugtracker">https://github.com/AnoY606-git/Impuls/issues</url>
+  <developer id="io.github.anoy606-git"><name>AnoY606-git and contributors</name></developer>
+  <content_rating type="oars-1.1" />
+  <releases><release version="1.0" date="2026-11-03" /></releases>
+</component>
