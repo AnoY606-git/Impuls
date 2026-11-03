@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gdk', '4.0')
-from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 Gtk.init_check()
 HAS_DISPLAY = Gdk.Display.get_default() is not None
 
@@ -78,6 +78,201 @@ class PlayerWindowTests(unittest.TestCase):
     def tearDown(self):
         if hasattr(self, 'window'):
             self.window.destroy()
+
+    def test_dropdown_popups_have_readable_spaced_rows(self):
+        self.window.set_equalizer_available(True)
+        self.window.present()
+        drain_until(lambda: self.window.get_width() > 0)
+        for selector in (self.window.quality_selector, self.window.preset_selector,
+                         self.window.visualization_selector):
+            with self.subTest(selector=selector):
+                if selector is self.window.visualization_selector:
+                    self.window.view_stack.set_visible_child_name('now')
+                selector.activate()
+                popover = next(w for w in walk(selector) if isinstance(w, Gtk.Popover))
+                drain_until(lambda: popover.get_mapped() and popover.get_height() > 0)
+                rows = [w for w in walk(popover) if w.get_css_name() == 'row']
+                self.assertGreater(len(rows), 1)
+                for row in rows:
+                    self.assertGreaterEqual(row.get_height(), 30)
+                    for label in (w for w in walk(row) if isinstance(w, Gtk.Label)):
+                        color = label.get_style_context().get_color()
+                        brightness = (color.red + color.green + color.blue) / 3
+                        if row.get_state_flags() & Gtk.StateFlags.SELECTED:
+                            self.assertGreater(brightness, 0.8)
+                        else:
+                            self.assertLess(brightness, 0.45)
+                popover.popdown()
+
+    def test_track_menu_copies_service_link_and_disables_invalid_ids(self):
+        from unittest.mock import Mock
+        self.window.get_clipboard = Mock(return_value=Mock())
+        track = SimpleNamespace(id='123:456', title='Песня')
+        menu = self.window._track_menu(track, 'Автор')
+        button(menu, 'Копировать ссылку на трек').emit('clicked')
+        self.window.get_clipboard().set.assert_called_once_with('https://music.yandex.ru/track/123')
+        self.assertEqual(self.window.status_label.get_label(), 'Ссылка на трек скопирована')
+        menu = self.window._track_menu(SimpleNamespace(id='invalid', title='Песня'), 'Автор')
+        self.assertFalse(button(menu, 'Копировать ссылку на трек').get_sensitive())
+
+    def test_restored_equalizer_expansion_survives_resizing(self):
+        self.window.set_equalizer_expanded(True)
+        for width, height in ((480, 360), (960, 800)):
+            self.window.allocate(width, height, -1, None)
+            self.assertTrue(self.window.equalizer_body.get_visible())
+        self.window.set_equalizer_expanded(False)
+        self.assertFalse(self.window.equalizer_body.get_visible())
+
+    def test_quality_popup_marks_the_current_setting(self):
+        self.window.present()
+        self.window.quality_selector.activate()
+        popover = next(w for w in walk(self.window.quality_selector) if isinstance(w, Gtk.Popover))
+        drain_until(lambda: popover.get_mapped() and popover.get_height() > 0)
+        for selected in (0, 2, 1):
+            self.window.quality_selector.set_selected(selected)
+            images = [w for w in walk(popover) if isinstance(w, Gtk.Image)
+                      and w.get_icon_name() == 'object-select-symbolic']
+            self.assertEqual(len(images), 3)
+            self.assertEqual([i for i, image in enumerate(images) if image.get_opacity() > 0.9], [selected])
+        popover.popdown()
+
+    def test_transitions_honor_disabled_system_animations(self):
+        settings = Gtk.Settings.get_default()
+        enabled = settings.get_property('gtk-enable-animations')
+        settings.set_property('gtk-enable-animations', False)
+        try:
+            self.window.present()
+            drain_until(lambda: self.window.get_width() > 0)
+            self.assertEqual(self.window.view_stack.get_transition_type(), Gtk.StackTransitionType.CROSSFADE)
+            self.assertEqual(self.window.equalizer_revealer.get_transition_type(), Gtk.RevealerTransitionType.SLIDE_DOWN)
+            self.window.set_equalizer_expanded(True)
+            drain_until(lambda: self.window.equalizer_revealer.get_child_revealed())
+            self.window.set_equalizer_expanded(False)
+            drain_until(lambda: not self.window.equalizer_body.get_visible())
+            self.window.view_stack.set_visible_child_name('now')
+            self.assertFalse(self.window.view_stack.get_transition_running())
+        finally:
+            settings.set_property('gtk-enable-animations', enabled)
+
+    def test_transport_symbols_are_centered_images(self):
+        for widget, icon in ((self.window.favorite_button, 'emblem-favorite-symbolic'),
+                             (self.window.shuffle_button, 'media-playlist-shuffle-symbolic'),
+                             (self.window.repeat_button, 'media-playlist-repeat-symbolic')):
+            with self.subTest(icon=icon):
+                images = [w for w in walk(widget) if isinstance(w, Gtk.Image)]
+                self.assertTrue(any(image.get_icon_name() == icon for image in images))
+        self.assertFalse(self.window.favorite_button.get_always_show_arrow())
+
+    def test_keyboard_volume_and_seek_respect_limits_and_editable_focus(self):
+        self.window.set_playback(True, 2000, 60000)
+        self.window.set_focus(None)
+        for key, modifier in ((Gdk.KEY_Left, Gdk.ModifierType.ALT_MASK),
+                              (Gdk.KEY_Right, Gdk.ModifierType.ALT_MASK),
+                              (Gdk.KEY_Up, Gdk.ModifierType.CONTROL_MASK)):
+            self.assertTrue(self.window._keyboard.emit('key-pressed', key, 0, modifier))
+        self.assertEqual(self.calls[:2], [('seek', (0.0,)), ('seek', (7 / 60,))])
+        self.assertAlmostEqual(self.window.volume_scale.get_value(), 0.8)
+        self.window.set_playback(True, 59000, 60000)
+        self.window._keyboard.emit('key-pressed', Gdk.KEY_Right, 0, Gdk.ModifierType.ALT_MASK)
+        self.assertEqual(self.calls[-1], ('seek', (1.0,)))
+        self.window.set_focus(self.window.search_entry)
+        count = len(self.calls)
+        self.assertFalse(self.window._keyboard.emit('key-pressed', Gdk.KEY_Left, 0, Gdk.ModifierType.ALT_MASK))
+        self.assertFalse(self.window._keyboard.emit('key-pressed', Gdk.KEY_Up, 0, Gdk.ModifierType.CONTROL_MASK))
+        self.assertEqual(len(self.calls), count)
+        self.window.set_focus(None)
+        self.window.set_playback(False, 0, 0)
+        self.assertFalse(self.window._keyboard.emit('key-pressed', Gdk.KEY_Right, 0, Gdk.ModifierType.ALT_MASK))
+
+    def test_sleep_timer_menu_and_countdown(self):
+        self.window.actions['set_sleep_timer'] = lambda minutes: self.calls.append(('set_sleep_timer', (minutes,)))
+        button(self.window, '15 мин').emit('clicked')
+        button(self.window, '30 мин').emit('clicked')
+        button(self.window, '60 мин').emit('clicked')
+        button(self.window, 'Отменить таймер').emit('clicked')
+        self.assertEqual(self.calls, [('set_sleep_timer', (15,)), ('set_sleep_timer', (30,)),
+                                      ('set_sleep_timer', (60,)), ('set_sleep_timer', (0,))])
+        self.window.set_sleep_timer_remaining(89)
+        self.assertTrue(self.window.sleep_timer_label.get_visible())
+        self.assertIn('1:29', self.window.sleep_timer_label.get_label())
+        self.window.set_sleep_timer_remaining(None)
+        self.assertFalse(self.window.sleep_timer_label.get_visible())
+
+    def test_help_is_searchable_local_and_has_verified_project_links(self):
+        from impuls_player import __version__
+        button(self.window, 'Справка и о программе').emit('clicked')
+        dialog = self.window._help_window
+        self.assertIsNotNone(dialog)
+        self.window._show_help()
+        self.assertIs(self.window._help_window, dialog)
+        labels = [w.get_label() for w in walk(dialog) if isinstance(w, Gtk.Label)]
+        self.assertIn(f'Impuls {__version__}', labels)
+        self.assertTrue(any('GPL-3.0-only' in text for text in labels))
+        uris = {w.get_uri() for w in walk(dialog) if isinstance(w, Gtk.LinkButton)}
+        self.assertEqual(uris, {'https://github.com/AnoY606-git/Impuls',
+                               'https://github.com/AnoY606-git/Impuls/issues',
+                               'https://github.com/AnoY606-git/Impuls/releases',
+                               'https://github.com/AnoY606-git/Impuls/blob/main/LICENSE'})
+        search = next(w for w in walk(dialog) if isinstance(w, Gtk.SearchEntry))
+        search.set_text('lossless')
+        search.emit('search-changed')
+        topics = [w for w in walk(dialog) if isinstance(w, Gtk.Expander)]
+        matches = [w for w in topics if w.get_visible()]
+        self.assertEqual([w.get_label() for w in matches], ['Звук, качество и эквалайзер'])
+        self.assertTrue(matches[0].get_expanded())
+        search.set_text('несуществующий-раздел')
+        search.emit('search-changed')
+        self.assertFalse(any(w.get_visible() for w in topics))
+        self.assertTrue(any(isinstance(w, Gtk.Label) and w.get_label() == 'Ничего не найдено. Попробуйте другое слово.'
+                            and w.get_visible() for w in walk(dialog)))
+        self.assertEqual(self.calls, [])
+
+    def test_help_fits_small_windows_and_closes_with_player(self):
+        self.window._show_help()
+        dialog = self.window._help_window
+        dialog.set_default_size(360, 360)
+        drain_until(lambda: dialog.get_width() > 0)
+        self.assertLessEqual(dialog.get_width(), 380)
+        scroller = next(w for w in walk(dialog) if isinstance(w, Gtk.ScrolledWindow))
+        self.assertEqual(scroller.get_policy(), (Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC))
+        button(dialog, 'Закрыть').emit('clicked')
+        self.assertIsNone(self.window._help_window)
+        self.window._show_help()
+        dialog = self.window._help_window
+        dialog.close()
+        self.assertIsNone(self.window._help_window)
+        self.window._show_help()
+        self.window.destroy()
+        self.assertIsNone(self.window._help_window)
+
+    def test_album_column_header_and_rows_share_pixel_alignment(self):
+        tracks = [SimpleNamespace(id=str(i), title='Длинное название 🎵 ' * 12,
+                                  artists=('Исполнитель ' * 12,), album=album, duration_ms=123456)
+                  for i, album in enumerate(('Короткий', 'Альбом с длинным названием 漢字 ' * 10))]
+        self.window.set_tracks(tracks, 'Проверка колонок')
+        self.window.present()
+        drain_until(lambda: self.window.tracks_list.get_row_at_index(1) is not None)
+        self.window.allocate(960, 800, -1, None)
+        header_ok, header = self.window.column_album.compute_bounds(self.window)
+        self.assertTrue(header_ok)
+        for label in self.window._album_labels:
+            success, bounds = label.compute_bounds(self.window)
+            self.assertTrue(success)
+            self.assertAlmostEqual(bounds.get_x(), header.get_x(), delta=1)
+            self.assertAlmostEqual(bounds.get_width(), header.get_width(), delta=1)
+            self.assertEqual(label.get_xalign(), 0)
+            self.assertEqual(label.get_ellipsize(), Pango.EllipsizeMode.END)
+        self.window.allocate(480, 600, -1, None)
+        self.assertFalse(self.window.column_album.get_visible())
+        self.assertTrue(all(not label.get_visible() for label in self.window._album_labels))
+        self.window.set_now_playing(tracks[0])
+        self.assertEqual(self.window.now_title.get_tooltip_text(), tracks[0].title)
+        self.assertEqual(self.window.now_artist.get_tooltip_text(), tracks[0].artists[0])
+        self.assertEqual(self.window.visual_track_title.get_tooltip_text(), tracks[0].artists[0] + ' — ' + tracks[0].title)
+        self.window.set_playlists([SimpleNamespace(title='Плейлист 🎹 ' * 20, track_count=2)])
+        drain_until(lambda: self.window.playlists_list.get_row_at_index(0) is not None)
+        title = next(w for w in walk(self.window.playlists_list) if isinstance(w, Gtk.Label) and w.has_css_class('track-title'))
+        self.assertEqual(title.get_tooltip_text(), 'Плейлист 🎹 ' * 20)
 
     def test_refresh_and_list_playback_use_current_view_actions(self):
         self.assertTrue(hasattr(self.window, 'refresh_button'), 'Refresh control is missing')
@@ -449,18 +644,21 @@ class PlayerWindowTests(unittest.TestCase):
         def brightness(widget):
             c = widget.get_style_context().get_color()
             return 0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue
-        for widget, text in ((self.window.shuffle_button, '⇄'), (self.window.repeat_button, '↻'),
-                             (self.window.favorite_button, '♥'), (self.window.wave_button, 'Моя волна')):
+        def icon(widget):
+            return next(item for item in walk(widget) if isinstance(item, Gtk.Image))
+        for widget in (self.window.shuffle_button, self.window.repeat_button, self.window.favorite_button):
             backdrop(widget)
-            self.assertLess(brightness(label(widget, text)), 0.45, text)
+            self.assertLess(brightness(icon(widget)), 0.45)
+        backdrop(self.window.wave_button)
+        self.assertLess(brightness(label(self.window.wave_button, 'Моя волна')), 0.45)
         backdrop(self.window.view_switcher)
         self.assertLess(brightness(label(self.window.view_switcher, 'Медиатека')), 0.45)
         self.window.shuffle_button.set_active(True)
         self.window.shuffle_button.set_state_flags(Gtk.StateFlags.BACKDROP | Gtk.StateFlags.FOCUSED, False)
-        self.assertGreater(brightness(label(self.window.shuffle_button, '⇄')), 0.7)
+        self.assertGreater(brightness(icon(self.window.shuffle_button)), 0.7)
         self.window.set_now_playing(None)
         backdrop(self.window.favorite_button)
-        disabled = brightness(label(self.window.favorite_button, '♥'))
+        disabled = brightness(icon(self.window.favorite_button))
         self.assertFalse(self.window.favorite_button.get_sensitive())
         self.assertGreater(disabled, 0.3)
         self.assertLess(disabled, 0.6)

@@ -40,6 +40,28 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn('private', raw)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
+    def test_extended_preferences_and_legacy_defaults(self):
+        self.settings.save({'volume': .2})
+        defaults = self.settings.load()
+        self.assertFalse(defaults['shuffle'])
+        self.assertFalse(defaults['repeat'])
+        self.assertFalse(defaults['equalizer_expanded'])
+        self.assertEqual(defaults['window_size'], (960, 800))
+        self.assertFalse(defaults['window_maximized'])
+        values = {'shuffle': True, 'repeat': True, 'equalizer_expanded': True,
+                  'window_size': [1000, 700], 'window_maximized': True}
+        self.assertTrue(self.settings.save(values))
+        saved = self.settings.load()
+        for name in ('shuffle', 'repeat', 'equalizer_expanded', 'window_maximized'):
+            self.assertTrue(saved[name])
+        self.assertEqual(saved['window_size'], (1000, 700))
+        for size in ([1, 2], [999999, 700], [True, 500], '960,800', None):
+            self.settings.save({'window_size': size, 'shuffle': 'false', 'repeat': 1})
+            saved = self.settings.load()
+            self.assertEqual(saved['window_size'], (960, 800))
+            self.assertFalse(saved['shuffle'])
+            self.assertFalse(saved['repeat'])
+
     def test_each_invalid_field_falls_back_independently(self):
         self.path.parent.mkdir()
         for volume in (-1, 2, True, '0.5', float('nan'), float('inf')):

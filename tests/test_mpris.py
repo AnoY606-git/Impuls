@@ -5,6 +5,7 @@ import unittest
 
 from gi.repository import GLib
 
+from impuls_player.controller import Controller
 from impuls_player.mpris import Mpris, metadata_for_track, seek_fraction, track_path
 from impuls_player.service import Track
 
@@ -150,6 +151,43 @@ class MprisDispatchTests(unittest.TestCase):
         self.mpris.set_playback(True, 20000, 60000)
         self.call_player("Seek", GLib.Variant("(x)", (50000000,)))
         self.assertEqual(self.controller.calls[-1], ("next",))
+
+    def test_rejected_engine_seek_does_not_change_position_or_emit_seeked(self):
+        controller = Controller.__new__(Controller)
+        controller.player = _FakePlayer()
+        controller.player.seek = lambda _fraction: None
+        self.mpris._controller = controller
+        signals = []
+        class Connection:
+            def emit_signal(self, *args): signals.append(args)
+        connection = self.mpris._connection
+        try:
+            self.mpris._connection = Connection()
+            self.call_player('SetPosition', GLib.Variant('(ox)', (track_path(self.track), 15000000)))
+            self.assertEqual(self.mpris._position_ms, 20000)
+            self.assertEqual(signals, [])
+        finally:
+            self.mpris._connection = connection
+
+    def test_seek_publishes_the_position_accepted_by_the_engine(self):
+        controller = Controller.__new__(Controller)
+        controller.player = _FakePlayer()
+        controller.player.seek = lambda _fraction: 14321
+        self.mpris._controller = controller
+        signals = []
+        class Connection:
+            def emit_signal(self, *args): signals.append(args)
+        connection = self.mpris._connection
+        try:
+            self.mpris._connection = Connection()
+            self.call_player('SetPosition', GLib.Variant('(ox)', (track_path(self.track), 15000000)))
+            self.assertEqual(self.mpris._position_ms, 14321)
+            self.assertEqual(controller._last_position_ms, 14321)
+            self.assertEqual(len(signals), 1)
+            self.assertEqual(signals[0][3], 'Seeked')
+            self.assertEqual(signals[0][4].unpack(), (14321000,))
+        finally:
+            self.mpris._connection = connection
 
     def test_pause_and_play_do_not_toggle_if_already_in_that_state(self):
         self.call_player("Play")

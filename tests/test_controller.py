@@ -122,6 +122,49 @@ class ControllerTests(unittest.TestCase):
         self.executor.run()
         self.executor.run()
 
+    def test_sleep_timer_expires_once_and_stops_pending_playback(self):
+        self.open_two_track_queue()
+        updates = []
+        self.window.set_sleep_timer_remaining = updates.append
+        with patch('impuls_player.controller.monotonic', return_value=100):
+            self.controller.set_sleep_timer(15)
+        with patch('impuls_player.controller.monotonic', return_value=1000):
+            self.controller.monitor_playback(0, 10000)
+        self.assertFalse(self.controller.display_playing)
+        self.assertFalse(self.player.has_source)
+        self.assertIsNone(updates[-1])
+        self.assertIn('Таймер сна', self.window.status)
+        before = self.window.status
+        self.controller.monitor_playback(0, 10000)
+        self.assertEqual(self.window.status, before)
+
+    def test_sleep_timer_cancellation_and_invalid_values(self):
+        with patch('impuls_player.controller.monotonic', return_value=100):
+            self.controller.set_sleep_timer(30)
+            deadline = self.controller._sleep_deadline
+            for value in (-1, True, 1.5, '15', 9999):
+                self.controller.set_sleep_timer(value)
+                self.assertEqual(self.controller._sleep_deadline, deadline)
+            self.controller.set_sleep_timer(0)
+            self.assertIsNone(self.controller._sleep_deadline)
+
+    def test_sleep_timer_discards_a_stream_resolved_after_expiry(self):
+        self.login()
+        self.controller.play_track(Track('late'))
+        future, resolve = self.executor.jobs.pop()
+        stream = resolve()
+        self.assertTrue(self.controller.playback_pending)
+        with patch('impuls_player.controller.monotonic', return_value=100):
+            self.controller.set_sleep_timer(15)
+        with patch('impuls_player.controller.monotonic', return_value=1000):
+            self.controller.monitor_playback(0, 10000)
+        # The network operation began before expiration and completes later.
+        future.set_result(stream)
+        self.assertFalse(self.controller.playback_pending)
+        self.assertFalse(self.controller.display_playing)
+        self.assertFalse(self.player.has_source)
+        self.assertEqual(self.player.urls, [])
+
     def test_refresh_search_reloads_results_without_replacing_playing_queue(self):
         first, second = self.open_two_track_queue()
         service = self.controller._service

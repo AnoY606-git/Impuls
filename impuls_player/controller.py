@@ -81,6 +81,8 @@ class Controller:
         self._play = 0
         self._pending = 0
         self._closed = False
+        self._sleep_deadline = None
+        self._sleep_display = None
         self._auth_cancel = Event()
         self._api_lock = RLock()
         self._credential_lock = RLock()
@@ -98,7 +100,7 @@ class Controller:
             'open_playlist', 'play_track', 'toggle_playback', 'next_track',
             'previous_track', 'seek', 'set_volume', 'set_equalizer', 'equalizer_preset',
             'set_shuffle', 'set_repeat', 'set_liked', 'load_more', 'set_quality',
-            'refresh_view', 'play_all')}
+            'refresh_view', 'play_all', 'set_sleep_timer')}
 
     def _submit(self, task, success, error_message, valid=lambda: True, *, api=False, storage=False, essential=False, stream=False, failure=None):
         if self._closed:
@@ -699,8 +701,35 @@ class Controller:
         self.window.set_status(f'Восстановление потока… {self._recovery_attempts}/2')
         return True
 
+    def set_sleep_timer(self, minutes):
+        if type(minutes) is not int or not 0 <= minutes <= 180:
+            return
+        self._sleep_deadline = monotonic() + minutes * 60 if minutes else None
+        self._sleep_display = -1
+        self._update_sleep_timer()
+        self.window.set_status(f'Таймер сна: {minutes} мин' if minutes else 'Таймер сна выключен')
+
+    def _update_sleep_timer(self):
+        import math
+        remaining = (max(0, math.ceil(self._sleep_deadline - monotonic()))
+                     if self._sleep_deadline is not None else None)
+        expired = remaining == 0
+        if expired:
+            self._sleep_deadline = None
+            remaining = None
+            self.stop_playback()
+            self.window.set_status('Таймер сна: воспроизведение остановлено')
+        if remaining != self._sleep_display or expired:
+            self._sleep_display = remaining
+            update = getattr(self.window, 'set_sleep_timer_remaining', None)
+            if update is not None:
+                update(remaining)
+        return expired
+
     def monitor_playback(self, position, duration):
         """Detect a stalled PLAYING pipeline; silent audio still advances time."""
+        if not self._closed and self._update_sleep_timer():
+            return
         if (self._closed or self.playback_pending or not self._desired_playing
                 or not self.player.has_source or self._queue.current is None):
             self._progress_since = None
@@ -925,6 +954,8 @@ class Controller:
         position = self.player.seek(fraction)
         if isinstance(position, int) and not isinstance(position, bool) and position >= 0:
             self._last_position_ms = position
+            return position
+        return None
 
     def _cancel_page_advance(self):
         if self._page_advance_pending:

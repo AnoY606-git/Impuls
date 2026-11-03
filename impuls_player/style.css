@@ -124,7 +124,7 @@ button.transport-toggle:checked label, button.transport-toggle:checked:backdrop 
 .favorite-button > button:disabled { opacity: 1; background-image: linear-gradient(to bottom, #dce5eb, #bfced9); }
 .favorite-button > button:disabled label, .favorite-button > button:disabled:backdrop label { color: #6b7e8f; }
 .mute-button { min-width: 27px; min-height: 28px; padding: 0 2px; }
-.preset-selector button, .quality-selector button {
+.preset-selector > button, .quality-selector > button {
   min-height: 26px;
   padding: 0 7px;
   color: #183550;
@@ -134,8 +134,8 @@ button.transport-toggle:checked label, button.transport-toggle:checked:backdrop 
   border-top-color: #ffffff;
   border-radius: 6px;
 }
-.preset-selector button label, .quality-selector button label { color: #183550; }
-.quality-selector button { min-width: 0; padding: 0 5px; font-size: 11px; }
+.preset-selector > button label, .quality-selector > button label { color: #183550; }
+.quality-selector > button { min-width: 0; padding: 0 5px; font-size: 11px; }
 .quality-selector { font-weight: bold; }
 .preset-selector:disabled { opacity: 0.8; }
 
@@ -164,13 +164,13 @@ scale:disabled { opacity: 0.6; }
 .refresh-button { min-width: 26px; min-height: 25px; padding: 0 3px; }
 .list-actions { padding: 2px 3px 5px; }
 .list-actions .nav-button { min-height: 27px; font-size: 12px; }
-searchentry { min-height: 30px; padding: 0 8px; color: #f0f8ff; background: #193b60; border: 1px solid #315b80; border-bottom-color: #e9f6ff; border-radius: 7px; }
-searchentry text { color: #f0f8ff; background: transparent; }
+.music-search { min-height: 30px; padding: 0 8px; color: #f0f8ff; background: #193b60; border: 1px solid #315b80; border-bottom-color: #e9f6ff; border-radius: 7px; }
+.music-search text { color: #f0f8ff; background: transparent; }
 .list-well { margin: 0 2px; background: #102c50; border: 1px solid #3d5a77; border-right-color: #e6f2fc; border-bottom-color: #e6f2fc; border-radius: 5px; }
 .column-header { min-height: 27px; padding: 0 8px; background-image: linear-gradient(to bottom, #365f88, #234a73); border-bottom: 1px solid #12304e; }
 .column-label { color: #bdd7ec; font-size: 10px; font-weight: bold; letter-spacing: 0.6px; }
 .music-list { background: #102f55; }
-.music-list row { background: transparent; border-bottom: 1px solid alpha(#bfdfff, 0.04); }
+.music-list row { padding: 0; background: transparent; border-bottom: 1px solid alpha(#bfdfff, 0.04); }
 .music-list row.alternate { background: #14365e; }
 .music-list row:hover, .music-list row:focus { background: #24507e; }
 .music-list row.current-track { background: #285e91; box-shadow: inset 3px 0 #95d7ff; }
@@ -209,3 +209,68 @@ scrollbar slider { min-width: 6px; min-height: 6px; margin: 1px; border: 0; bord
 .popover-actions { padding: 8px; }
 .popover-actions button { min-height: 32px; color: #173550; background: #e6eff6; border: 1px solid #afc3d4; border-radius: 6px; }
 .shortcut-key { color: #234c70; font-family: monospace; font-size: 12px; font-weight: bold; }
+
+/* Popovers are separate native surfaces: their colors must not inherit the
+   desktop theme. These rules cover dropdown lists and all action menus. */
+popover { color: #193a57; background: transparent; }
+popover > contents {
+  padding: 6px;
+  color: #193a57;
+  background: #e7f0f7;
+  border: 1px solid #7895ae;
+  border-top-color: #ffffff;
+  border-radius: 9px;
+  box-shadow: 0 5px 16px alpha(#081d34, 0.3);
+}
+popover arrow { background: #e7f0f7; border-color: #7895ae; }
+dropdown popover listview { padding: 3px; color: #193a57; background: #e7f0f7; }
+dropdown popover row {
+  min-height: 32px;
+  padding: 2px 12px;
+  margin: 1px 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #193a57;
+  background: transparent;
+}
+dropdown popover row label, dropdown popover row image { color: #193a57; font-size: 13px; font-weight: normal; }
+dropdown popover row:hover { background: #d0e3f1; border-color: #b2cadc; }
+dropdown popover row:selected, dropdown popover row:selected:hover {
+  color: #f6fbff;
+  background: #295f8d;
+  border-color: #1d4d78;
+}
+dropdown popover row:selected label, dropdown popover row:selected image { color: #f6fbff; }
+dropdown popover row:focus-visible { outline: 2px solid #3b7daa; outline-offset: -2px; }
+dropdown > button arrow { color: #294c6a; min-width: 14px; min-height: 14px; }
+.popover-actions { padding: 4px; }
+.popover-actions button { padding: 3px 12px; }
+.popover-actions button:hover { background: #d0e3f1; }
+.popover-actions button:disabled, .popover-actions button:disabled label { color: #657b8f; opacity: 1; }
+.popover-caption { padding: 4px 5px; color: #355774; font-size: 12px; font-weight: bold; }
+popover separator, .dialog-content separator { min-height: 1px; margin: 3px 0; background: #adc3d5; }
+.transport-button image, .transport-toggle image, .favorite-button > button image { color: #173a5d; -gtk-icon-size: 17px; }
+.transport-toggle:checked image { color: #f0fbff; }
+.favorite-button > button:disabled image { color: #6b7e8f; }
+/* Child labels and editable text can also carry theme-specific foregrounds. */
+.dialog-content button label, .dialog-content checkbutton label { color: #173550; }
+.dialog-content .primary-button label { color: #f4fbff; }
+.dialog-content entry text, .dialog-content passwordentry text { color: #173550; background: transparent; }
+.dialog-content passwordentry { padding: 8px; color: #173550; background: #f8fcff; border: 1px solid #8ba2b5; border-radius: 7px; }
+.dialog-content checkbutton check { color: #f4fbff; background: #f8fcff; border: 1px solid #7895ae; }
+.dialog-content checkbutton check:checked { background: #295f8d; }
+.sleep-timer { color: #234f72; font-family: monospace; font-weight: bold; }
+
+/* Short transitions follow GTK's global reduced-motion preference. */
+button { transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease; }
+.music-search image { color: #bdd6e9; }
+.music-search placeholder { color: #b9cfdf; }
+
+.help-content { padding: 20px; }
+.help-topic { padding: 12px; color: #193a57; background: #edf5fa; border: 1px solid #adc3d5; border-radius: 7px; }
+.help-topic > title { min-height: 28px; color: #193a57; font-weight: bold; }
+.help-topic > title label, .help-topic > title expander { color: #193a57; }
+.help-topic .dialog-copy { line-height: 1.45; }
+.help-content .help-search, .help-content .help-search text { color: #173550; background: #f8fcff; }
+.help-content .help-search placeholder, .help-content .help-search image { color: #526c82; }
+.help-content button.link label { color: #1e527e; }

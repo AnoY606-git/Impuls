@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=1.1.0
+version=1.2.0
 wheel_name=yandex_music-3.2.2-py3-none-any.whl
 wheel_sha=f2e603530c74a4affd2bead6f42e7b17c5e83732a2dda752206ef6c0d3dbf515
 wheel_url=https://files.pythonhosted.org/packages/78/3d/4735a1171d293e6b4bb46e5f271cd4d62f6b74f5c28c494afa99a720df44/yandex_music-3.2.2-py3-none-any.whl
@@ -23,7 +23,8 @@ source_files=(
   tests/test_ui.py tests/test_ui_helpers.py tests/test_wave.py
   data/impuls data/io.github.AnoY606_git.Impuls.desktop
   data/io.github.AnoY606_git.Impuls.metainfo.xml data/io.github.AnoY606_git.Impuls.svg
-  docs/images/player.png docs/images/player-compact.png docs/images/visualizer.png
+  docs/images/player.png docs/images/player-compact.png docs/images/visualizer.png docs/images/visualization-menu.png docs/images/help.png
+  docs/reviews/1.2.0.md
   packaging/impuls.spec scripts/build-rpm.sh
 )
 create_source() {

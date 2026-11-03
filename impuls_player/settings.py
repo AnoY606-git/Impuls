@@ -10,7 +10,9 @@ import tempfile
 
 def _validated(values: object) -> dict:
     result = {'volume': .75, 'quality': 'hq', 'equalizer': (0.0,) * 10,
-              'visualization': 'ribbons'}
+              'visualization': 'ribbons', 'shuffle': False, 'repeat': False,
+              'equalizer_expanded': False, 'window_size': (960, 800),
+              'window_maximized': False}
     if not isinstance(values, dict):
         return result
     volume = values.get('volume')
@@ -27,6 +29,14 @@ def _validated(values: object) -> dict:
     mode = values.get('visualization')
     if isinstance(mode, str) and mode in ('ribbons', 'bars', 'mirror', 'orbit'):
         result['visualization'] = mode
+    for name in ('shuffle', 'repeat', 'equalizer_expanded', 'window_maximized'):
+        if type(values.get(name)) is bool:
+            result[name] = values[name]
+    size = values.get('window_size')
+    if (isinstance(size, (list, tuple)) and len(size) == 2
+            and all(type(dimension) is int for dimension in size)
+            and 480 <= size[0] <= 16384 and 360 <= size[1] <= 16384):
+        result['window_size'] = tuple(size)
     return result
 
 

@@ -26,8 +26,8 @@ jobs:
         with:
           name: impuls-fedora-rpm
           path: |
-            dist/impuls-1.1.0-1.fc45.noarch.rpm
-            dist/impuls-1.1.0-1.fc45.src.rpm
+            dist/impuls-1.2.0-1.fc45.noarch.rpm
+            dist/impuls-1.2.0-1.fc45.src.rpm
             dist/SHA256SUMS
           if-no-files-found: error
 
@@ -41,7 +41,7 @@ jobs:
           name: impuls-fedora-rpm
           path: dist
       - name: Install only required dependencies
-        run: dnf install -y --setopt=install_weak_deps=False ./dist/impuls-1.1.0-1.fc45.noarch.rpm
+        run: dnf install -y --setopt=install_weak_deps=False ./dist/impuls-1.2.0-1.fc45.noarch.rpm
       - name: Check installed imports and audio plugins
         run: |
           PYTHONPATH=/usr/share/impuls:/usr/share/impuls/vendor python3 - <<'PYTEST'

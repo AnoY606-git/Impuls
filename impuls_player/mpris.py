@@ -332,8 +332,10 @@ class Mpris:
         fraction = seek_fraction(position_us, self._duration_ms * 1000)
         if fraction is None:
             return
-        self._controller.seek(fraction)
-        self._position_ms = position_us // 1000
+        accepted = self._controller.seek(fraction)
+        if not isinstance(accepted, int) or isinstance(accepted, bool) or accepted < 0:
+            return
+        self._position_ms = _safe_milliseconds(accepted)
         if self._connection is not None:
             try:
                 self._connection.emit_signal(None, _OBJECT_PATH, _PLAYER, "Seeked",

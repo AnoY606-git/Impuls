@@ -1,6 +1,10 @@
 """Smoke test the wired GTK application without a real account or keyring."""
 import unittest
 import tempfile
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -101,9 +105,120 @@ class ApplicationLifecycleTests(unittest.TestCase):
             self.assertEqual(saved['equalizer'][4], -3)
             self.assertEqual(saved['visualization'], 'mirror')
 
+            # An atomic write failure keeps the previous file and is visible;
+            # subsequent successful changes must resume persistence.
+            before = application.settings.path.read_bytes()
+            errors = []
+            window.show_error = errors.append
+            window.volume_scale.value = .8
+            with (patch('impuls_player.settings.os.replace', side_effect=OSError),
+                  self.assertLogs('impuls_player.app', level='WARNING')):
+                self.assertFalse(application._save_settings())
+                self.assertFalse(application._save_settings())
+            self.assertEqual(application.settings.path.read_bytes(), before)
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(application._save_settings())
+            self.assertEqual(application.settings.load()['volume'], .8)
+
 
 @unittest.skipUnless(GTK_AVAILABLE, 'GTK display is unavailable')
 class ApplicationSmokeTests(unittest.TestCase):
+    def test_settings_survive_real_close_reopen_and_tray_hide(self):
+        # Each run is a fresh GTK process, with a real main loop and fake
+        # credentials; closing a real window exercises shutdown ordering.
+        script = textwrap.dedent("""
+            import sys
+            from unittest.mock import patch
+            from gi.repository import Gio, GLib
+            from impuls_player.app import ImpulsApplication
+            from impuls_player.settings import Settings
+            class Store:
+                def load(self): return None
+                def clear(self): pass
+                def save(self, token): pass
+            errors = []
+            phase, path = sys.argv[1:]
+            def check_saved(app):
+                values = app.settings.load()
+                assert values['volume'] == .31, values
+                assert values['quality'] == 'lossless', values
+                assert values['equalizer'][0] == 4, values
+                assert values['visualization'] == 'orbit', values
+                assert values['shuffle'] and values['repeat'], values
+                assert values['equalizer_expanded'], values
+                assert values['window_size'] == (1000, 720), values
+            with patch('impuls_player.app.SecretStore', return_value=Store()):
+                app = ImpulsApplication()
+                app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
+                app.settings = Settings(path)
+                def verify_open():
+                    try:
+                        check_saved(app)
+                        assert app.window.get_visible()
+                        app.window.close()
+                    except Exception as exc:
+                        errors.append(repr(exc))
+                        app.request_quit()
+                    return False
+                def activated(_):
+                    def exercise():
+                        try:
+                            win = app.window
+                            if phase == 'reopen':
+                                assert win.volume_scale.get_value() == .31
+                                assert win.quality_selector.get_selected() == 2
+                                assert win.equalizer_sliders[0].get_value() == 4
+                                assert win._visualization_mode == 'orbit'
+                                assert app.controller.shuffle_enabled
+                                assert app.controller.repeat_enabled
+                                assert win.equalizer_toggle.get_active()
+                                assert tuple(win.get_default_size()) == (1000, 720)
+                                app.request_quit()
+                            else:
+                                win.volume_scale.set_value(.31)
+                                win.quality_selector.set_selected(2)
+                                win.equalizer_sliders[0].set_value(4)
+                                win.visualization_selector.set_selected(3)
+                                win.shuffle_button.set_active(True)
+                                win.repeat_button.set_active(True)
+                                win.equalizer_toggle.set_active(True)
+                                win.set_default_size(1000, 720)
+                                if phase == 'autosave':
+                                    GLib.timeout_add(900, verify_open)
+                                elif phase == 'tray':
+                                    with patch.object(app.tray, 'available', True):
+                                        win.close()
+                                        assert not win.get_visible()
+                                        check_saved(app)
+                                        app.present_window()
+                                        assert win.get_visible()
+                                    app.request_quit()
+                                else:
+                                    win.close()
+                                    # Preferences must be durable before GTK shutdown.
+                                    check_saved(app)
+                        except Exception as exc:
+                            errors.append(repr(exc))
+                            app.request_quit()
+                        return False
+                    GLib.timeout_add(150, exercise)
+                app.connect('activate', activated)
+                GLib.timeout_add_seconds(10, lambda: (errors.append('timeout'), app.request_quit(), False)[2])
+                app.run([])
+                assert not errors, errors
+                check_saved(app)
+        """)
+        with tempfile.TemporaryDirectory() as folder:
+            for phase in ('close', 'autosave', 'tray'):
+                path = str(Path(folder) / f'{phase}.json')
+                for step in (phase, 'reopen'):
+                    with self.subTest(phase=phase, step=step):
+                        result = subprocess.run(
+                            [sys.executable, '-c', script, step, path],
+                            text=True, capture_output=True, timeout=15,
+                            env={**os.environ, 'GTK_A11Y': 'none'})
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_application_connects_window_and_actions(self):
         from impuls_player.app import ImpulsApplication
         from impuls_player.settings import Settings
