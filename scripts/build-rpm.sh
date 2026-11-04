@@ -27,6 +27,7 @@ source_files=(
   data/io.github.AnoY606_git.Impuls.metainfo.xml data/io.github.AnoY606_git.Impuls.svg
   docs/images/player.png docs/images/player-compact.png docs/images/visualizer.png docs/images/visualization-menu.png docs/images/help.png
   docs/images/player-mini.png
+  docs/DEVELOPMENT.md
   packaging/impuls.spec scripts/build-rpm.sh
 )
 create_source() {

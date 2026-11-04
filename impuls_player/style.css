@@ -6,6 +6,17 @@ window, .app-shell {
   font-size: 13px;
 }
 .app-shell { padding: 8px; }
+/* Own the complete button surface; desktop themes must not add state layers. */
+button {
+  background: transparent;
+  border: 1px solid transparent;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+button label, button image { color: inherit; background: transparent; text-shadow: none; -gtk-icon-shadow: none; }
+button image { -gtk-icon-filter: none; }
 .window-header {
   min-height: 30px;
   padding: 1px 7px;
@@ -19,8 +30,11 @@ window, .app-shell {
 .window-header windowcontrols button { min-width: 25px; min-height: 24px; margin: 0; padding: 0; color: #24435f; background: transparent; border: 1px solid transparent; border-radius: 5px; box-shadow: none; }
 /* Some desktop themes make the child image transparent for their own CSD. */
 .window-header windowcontrols button image { color: #24435f; }
-.window-header .mini-mode-toggle { min-width: 28px; min-height: 26px; padding: 0; color: #24435f; }
+.window-header .mini-mode-toggle { min-width: 28px; min-height: 26px; padding: 0; color: #24435f; border-radius: 5px; }
 .window-header .mini-mode-toggle image { color: #24435f; }
+.window-header .mini-mode-toggle:hover { background: #eff9ff; border-color: #9eb7ca; }
+.window-header .mini-mode-toggle:checked { background: #afcede; border-color: #6f94b0; }
+.window-header .mini-mode-toggle:active { background: #a2c3d9; }
 .window-header windowcontrols button:hover { background: #eff9ff; border-color: #9eb7ca; }
 .window-header windowcontrols button.close:hover { color: #ffffff; background: #a83d4e; border-color: #913348; }
 .window-header windowcontrols button.close:hover image { color: #ffffff; }
@@ -48,13 +62,11 @@ window, .app-shell {
   color: #173550;
   background-image: linear-gradient(to bottom, #ffffff, #dce8f0 48%, #bdcedd);
   border: 1px solid #7891a8;
-  border-top-color: #ffffff;
   border-radius: 7px;
-  box-shadow: 0 1px 1px alpha(#173550, 0.12);
+  box-shadow: inset 0 1px 1px alpha(#ffffff, 0.6), 0 1px 1px alpha(#173550, 0.12);
 }
 .title-button { min-height: 25px; min-width: 42px; padding: 1px 9px; font-size: 12px; font-weight: bold; }
 .equalizer-toggle { min-width: 24px; padding: 0 4px; }
-button:hover { filter: brightness(1.08); }
 button:backdrop { opacity: 1; }
 button:disabled { opacity: 0.5; }
 button.title-button label, button.title-button:backdrop label,
@@ -67,6 +79,9 @@ button:focus-visible, entry:focus-visible, searchentry:focus-visible, scale:focu
   outline: 2px solid #ffe096;
   outline-offset: 1px;
 }
+/* Keep focus rings inside clipped scroll areas and compound controls. */
+.music-list row:focus-visible, dropdown > button:focus-visible { outline-offset: -3px; }
+dropdown > button:focus-visible { outline-color: #2e6693; }
 .view-switcher button {
   min-height: 26px;
   padding: 0 10px;
@@ -78,6 +93,9 @@ button:focus-visible, entry:focus-visible, searchentry:focus-visible, scale:focu
   border-radius: 5px;
 }
 .view-switcher button:checked { color: #173550; background-image: linear-gradient(to bottom, #f6fcff, #c2dceb); }
+.view-switcher button:hover { background-image: linear-gradient(to bottom, #5c87b2, #305a85); }
+.view-switcher button:checked:hover { background-image: linear-gradient(to bottom, #ffffff, #d1e7f4); }
+.view-switcher button:active { box-shadow: inset 0 1px 3px alpha(#071d34, 0.35); }
 .view-switcher button label, .view-switcher button:backdrop label { color: #e6f3ff; }
 .view-switcher button:checked label, .view-switcher button:checked:backdrop label { color: #173550; }
 .app-menu > button { min-width: 25px; min-height: 25px; padding: 0 3px; }
@@ -119,15 +137,24 @@ button:focus-visible, entry:focus-visible, searchentry:focus-visible, scale:focu
   min-height: 32px;
   padding: 2px;
   color: #183d62;
-  background-image: linear-gradient(to bottom, #ffffff, #e3edf5 42%, #b0c4d5 58%, #d5e3ed);
+  background-image: linear-gradient(to bottom, #f9fcff, #e1ebf3 45%, #c3d4e1 70%, #d5e3ed);
   border: 1px solid #738da5;
-  border-top-color: #ffffff;
-  border-radius: 999px;
-  box-shadow: 0 2px 2px alpha(#1a3652, 0.18);
+  border-radius: 50%;
+  box-shadow: inset 0 1px 1px alpha(#ffffff, 0.7), 0 1px 2px alpha(#1a3652, 0.18);
 }
 .play-button { min-width: 40px; min-height: 40px; color: #073c72; border-color: #648cae; }
+.transport-button:hover, .favorite-button > button:hover, .transport-toggle:hover {
+  background-image: linear-gradient(to bottom, #ffffff, #e9f5fd 45%, #c4dcec);
+  border-color: #4f7fa3;
+}
+.transport-button:active, .favorite-button > button:active, .favorite-button > button:checked, .transport-toggle:active {
+  background-image: linear-gradient(to bottom, #a9c3d7, #d2e3ef);
+  border-color: #507594;
+  box-shadow: inset 0 1px 3px alpha(#173550, 0.3);
+}
 .transport-toggle { font-size: 19px; font-weight: bold; }
 .transport-toggle:checked { color: #effbff; background-image: linear-gradient(to bottom, #478fc4, #16528a); border-color: #174b78; }
+.transport-toggle:checked:hover { background-image: linear-gradient(to bottom, #5b9ed0, #23689e); }
 button.transport-toggle label, button.transport-toggle:backdrop label { color: #173a5d; }
 button.transport-toggle:checked label, button.transport-toggle:checked:backdrop label { color: #f0fbff; }
 .favorite-button > button { font-size: 19px; }
@@ -142,27 +169,60 @@ button.transport-toggle:checked label, button.transport-toggle:checked:backdrop 
   font-size: 12px;
   background-image: linear-gradient(to bottom, #f9fdff, #cfdee9);
   border: 1px solid #7891a8;
-  border-top-color: #ffffff;
   border-radius: 6px;
+  box-shadow: inset 0 1px 1px alpha(#ffffff, 0.6);
 }
 .preset-selector > button label, .quality-selector > button label { color: #183550; }
 .quality-selector > button { min-width: 0; padding: 0 5px; font-size: 11px; }
 .quality-selector { font-weight: bold; }
 .preset-selector:disabled { opacity: 0.8; }
+/* The selected item is itself a row. Its hover/selection background is not
+   part of the button surface, and must never pick up a desktop accent. */
+dropdown > button row, dropdown > button row:hover, dropdown > button row:active,
+dropdown > button row:selected, dropdown > button row:selected:hover {
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  outline: none;
+}
+
+.title-button:hover, .nav-button:hover, .refresh-button:hover, .mute-button:hover,
+.app-menu > button:hover, .preset-selector > button:hover, .quality-selector > button:hover,
+.moment-button:hover, .dialog-content button:hover {
+  background-image: linear-gradient(to bottom, #ffffff, #e3f1fa 48%, #c5ddeb);
+  border-color: #5885a6;
+}
+.title-button:active, .nav-button:active, .refresh-button:active, .mute-button:active,
+.app-menu > button:active, .app-menu > button:checked,
+.preset-selector > button:active, .preset-selector > button:checked,
+.quality-selector > button:active, .quality-selector > button:checked,
+.moment-button:active, .dialog-content button:active {
+  background-image: linear-gradient(to bottom, #adc6d9, #d6e6f0);
+  border-color: #567b98;
+  box-shadow: inset 0 1px 3px alpha(#173550, 0.25);
+}
+.equalizer-toggle:checked { background-image: linear-gradient(to bottom, #cae3f4, #a8cbe3); border-color: #5484a8; }
 
 .equalizer-body { min-height: 85px; padding: 7px 10px 3px; }
 .gain-gauge { padding: 0 3px; }
 .gain-label { color: #36536c; font-family: monospace; font-size: 10px; }
 .band { min-width: 24px; }
 .frequency-label { color: #294761; font-family: monospace; font-size: 10px; font-weight: bold; }
-scale trough { min-height: 5px; min-width: 5px; padding: 0; margin: 0; border: 1px solid #4d6b86; border-radius: 6px; background: #254363; }
+scale trough { min-height: 5px; min-width: 5px; padding: 0; margin: 0; border: 1px solid #4d6b86; border-radius: 6px; background: #254363; box-shadow: none; }
 scale.horizontal { min-height: 22px; padding: 0; margin: 0; }
-scale highlight { border-radius: 6px; background: #52a6da; }
-scale slider { min-width: 14px; min-height: 14px; margin: 0; border: 1px solid #5b7894; border-top-color: #ffffff; border-radius: 50%; background-image: linear-gradient(to bottom, #ffffff, #afc9dc); }
+scale highlight { min-width: 0; min-height: 0; margin: 0; padding: 0; border: 0; border-radius: 6px; background: #52a6da; box-shadow: none; }
+scale slider { min-width: 14px; min-height: 14px; margin: 0; border: 1px solid #6d89a1; border-radius: 50%; background-image: linear-gradient(to bottom, #f9fcff, #afc9dc); box-shadow: inset 0 1px 1px alpha(#ffffff, 0.65); }
+scale slider:hover { border-color: #3e739b; background-image: linear-gradient(to bottom, #ffffff, #c3e0f2); }
+scale slider:active { border-color: #315f83; background-image: linear-gradient(to bottom, #a5c4da, #e3f2fc); }
 scale.horizontal slider { margin-top: -4px; margin-bottom: -4px; }
 scale.vertical { min-height: 60px; padding: 0; margin: 0; }
 scale.vertical trough { min-width: 5px; min-height: 58px; }
-scale.vertical slider { min-width: 20px; min-height: 11px; margin-left: -7px; margin-right: -7px; border-radius: 4px; background-image: linear-gradient(to bottom, #ffffff, #d1e2ed 45%, #98b5cb 55%, #d8e8f3); }
+scale.vertical slider { min-width: 20px; min-height: 11px; margin-left: -7px; margin-right: -7px; border-radius: 4px; background-image: linear-gradient(to bottom, #f9fcff, #d1e2ed 45%, #acc6d9 70%, #d8e8f3); }
+scale.vertical slider:hover { background-image: linear-gradient(to bottom, #ffffff, #c3e0f2); }
+scale.vertical slider:active { background-image: linear-gradient(to bottom, #a5c4da, #e3f2fc); }
 scale:disabled { opacity: 0.6; }
 
 .library-panel, .visualizer-panel { min-height: 0; }
@@ -175,8 +235,13 @@ scale:disabled { opacity: 0.6; }
 .refresh-button { min-width: 26px; min-height: 25px; padding: 0 3px; }
 .list-actions { padding: 2px 3px 5px; }
 .list-actions .nav-button { min-height: 27px; font-size: 12px; }
-.music-search { min-height: 30px; padding: 0 8px; color: #f0f8ff; background: #193b60; border: 1px solid #315b80; border-bottom-color: #e9f6ff; border-radius: 7px; }
+.music-search { min-height: 30px; padding: 0 8px; color: #f0f8ff; background: #193b60; border: 1px solid #315b80; border-radius: 7px; }
 .music-search text { color: #f0f8ff; background: transparent; }
+entry, passwordentry { box-shadow: none; text-shadow: none; }
+/* The palette already accounts for placeholders; avoid theme opacity on top. */
+entry placeholder { opacity: 1; }
+.music-search:focus-within { border-color: #8dc8ef; box-shadow: inset 0 0 0 1px alpha(#8dc8ef, 0.35); }
+entry selection, passwordentry selection { color: #ffffff; background: #326b9b; }
 .list-well { margin: 0 2px; background: #102c50; border: 1px solid #3d5a77; border-right-color: #e6f2fc; border-bottom-color: #e6f2fc; border-radius: 5px; }
 .column-header { min-height: 27px; padding: 0 8px; background-image: linear-gradient(to bottom, #365f88, #234a73); border-bottom: 1px solid #12304e; }
 .column-label { color: #bdd7ec; font-size: 10px; font-weight: bold; letter-spacing: 0.6px; }
@@ -192,6 +257,8 @@ scale:disabled { opacity: 0.6; }
 .track-album { color: #afcbe2; font-size: 12px; }
 .row-play, .track-menu > button { min-width: 28px; min-height: 28px; padding: 0; color: #e6f4ff; background: alpha(#8cbee8, 0.12); border: 1px solid alpha(#a4caec, 0.3); border-radius: 6px; box-shadow: none; }
 .track-menu > button { min-width: 26px; border-color: transparent; background: transparent; }
+.row-play:hover, .track-menu > button:hover { background: #376b97; border-color: #9cc4e3; }
+.row-play:active, .track-menu > button:active, .track-menu > button:checked { background: #173f65; border-color: #87b4d7; box-shadow: inset 0 1px 2px alpha(#071d34, 0.4); }
 .playlist-badge, .playlist-arrow { color: #c7e5fa; font-size: 22px; padding: 0 6px; }
 .empty-state { padding: 32px 20px; color: #bed8ed; font-size: 14px; }
 scrollbar slider { min-width: 6px; min-height: 6px; margin: 1px; border: 0; border-radius: 4px; background: #8eaec8; }
@@ -213,11 +280,13 @@ scrollbar slider { min-width: 6px; min-height: 6px; margin: 1px; border: 0; bord
 .dialog-title { color: #15354f; font-size: 21px; font-weight: bold; }
 .dialog-subtitle { font-size: 13px; font-weight: bold; color: #294c6b; }
 .dialog-copy { font-size: 13px; color: #294963; }
-.dialog-content button { min-height: 32px; padding: 4px 12px; color: #173550; background-image: linear-gradient(to bottom, #ffffff, #c5d8e6); border: 1px solid #7b96ac; border-top-color: #ffffff; border-radius: 7px; }
+.dialog-content button { min-height: 32px; padding: 4px 12px; color: #173550; background-image: linear-gradient(to bottom, #ffffff, #c5d8e6); border: 1px solid #7b96ac; border-radius: 7px; }
 .dialog-content .primary-button { color: #f4fbff; background-image: linear-gradient(to bottom, #5487b6, #235887); border-color: #2f6088; font-weight: bold; }
+.dialog-content .primary-button:hover { background-image: linear-gradient(to bottom, #3f78a5, #235f8b); }
+.dialog-content .primary-button:active { background-image: linear-gradient(to bottom, #214e77, #4e83ae); }
 .dialog-content entry { background: #f8fcff; border: 1px solid #8ba2b5; border-radius: 7px; color: #173550; padding: 8px; }
 .device-code { padding: 14px; background: #11365c; border: 1px solid #688eac; border-radius: 7px; color: #dcf3ff; font-family: monospace; font-size: 27px; font-weight: bold; letter-spacing: 4px; }
-.popover-actions { padding: 8px; }
+.popover-actions { padding: 4px; }
 .popover-actions button { min-height: 32px; color: #173550; background: #e6eff6; border: 1px solid #afc3d4; border-radius: 6px; }
 .shortcut-key { color: #234c70; font-family: monospace; font-size: 12px; font-weight: bold; }
 
@@ -254,13 +323,15 @@ dropdown popover row:selected, dropdown popover row:selected:hover {
 dropdown popover row:selected label, dropdown popover row:selected image { color: #f6fbff; }
 dropdown popover row:focus-visible { outline: 2px solid #3b7daa; outline-offset: -2px; }
 dropdown > button arrow { color: #294c6a; min-width: 14px; min-height: 14px; }
-.popover-actions { padding: 4px; }
 .popover-actions button { padding: 3px 12px; }
 .popover-actions button:hover { background: #d0e3f1; }
+.popover-actions button:active { background: #b7d1e4; border-color: #7197b6; box-shadow: inset 0 1px 2px alpha(#173550, 0.2); }
 .popover-actions button:disabled, .popover-actions button:disabled label { color: #657b8f; opacity: 1; }
 .popover-caption { padding: 4px 5px; color: #355774; font-size: 12px; font-weight: bold; }
 popover separator, .dialog-content separator { min-height: 1px; margin: 3px 0; background: #adc3d5; }
-.transport-button image, .transport-toggle image, .favorite-button > button image { color: #173a5d; -gtk-icon-size: 17px; }
+/* Symbolic icons are designed on a 16px grid; avoid resampling them to 17px. */
+button image { -gtk-icon-size: 16px; }
+.transport-button image, .transport-toggle image, .favorite-button > button image { color: #173a5d; }
 .transport-toggle:checked image { color: #f0fbff; }
 .favorite-button > button:disabled image { color: #6b7e8f; }
 /* Child labels and editable text can also carry theme-specific foregrounds. */
@@ -272,8 +343,6 @@ popover separator, .dialog-content separator { min-height: 1px; margin: 3px 0; b
 .dialog-content checkbutton check:checked { background: #295f8d; }
 .sleep-timer { color: #234f72; font-family: monospace; font-weight: bold; }
 
-/* Short transitions follow GTK's global reduced-motion preference. */
-button { transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease; }
 .music-search image { color: #bdd6e9; }
 .music-search placeholder { color: #b9cfdf; }
 
@@ -285,3 +354,5 @@ button { transition: background-color 120ms ease, color 120ms ease, box-shadow 1
 .help-content .help-search, .help-content .help-search text { color: #173550; background: #f8fcff; }
 .help-content .help-search placeholder, .help-content .help-search image { color: #526c82; }
 .help-content button.link label { color: #1e527e; }
+tooltip { color: #f0f7ff; background: #193b60; border: 1px solid #7193b2; border-radius: 6px; box-shadow: 0 2px 5px alpha(#071d34, 0.2); }
+tooltip label { color: #f0f7ff; font-size: 12px; text-shadow: none; }
